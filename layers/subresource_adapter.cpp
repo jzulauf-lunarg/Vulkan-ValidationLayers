@@ -25,6 +25,29 @@
 #include "core_validation_types.h"
 #include <cmath>
 
+#define DEBUG_PRINT_S(enable, msg)                               \
+    {                                                            \
+        if (enable) {                                            \
+            printf("%s:%d: %s\n", __func__, int(__LINE__), msg); \
+            fflush(stdout);                                      \
+        }                                                        \
+    }
+#define DEBUG_PRINT_U64(enable, name, index)                                                                \
+    {                                                                                                       \
+        if (enable) {                                                                                       \
+            printf("%s:%d: %s=%" PRIu64 "\n", __func__, int(__LINE__), name, static_cast<uint64_t>(index)); \
+            fflush(stdout);                                                                                 \
+        }                                                                                                   \
+    }
+#define DEBUG_PRINT_RANGE(enable, name, r)                                                                                    \
+    {                                                                                                                         \
+        if (enable) {                                                                                                         \
+            printf("%s:%d: %s={ %" PRIu64 ", %" PRIu64 " }\n", __func__, int(__LINE__), name, static_cast<uint64_t>(r.begin), \
+                   static_cast<uint64_t>(r.end));                                                                             \
+            fflush(stdout);                                                                                                   \
+        }                                                                                                                     \
+    }
+
 namespace subresource_adapter {
 Subresource::Subresource(const RangeEncoder& encoder, const VkImageSubresource& subres)
     : VkImageSubresource({0, subres.mipLevel, subres.arrayLayer}), aspect_index() {
@@ -445,31 +468,48 @@ void ImageRangeGenerator::SetPos() {
 }
 
 ImageRangeGenerator* ImageRangeGenerator::operator++() {
+    const bool debug_enable = true;
+    DEBUG_PRINT_RANGE(debug_enable, "pos_ top", pos_);
+
+    DEBUG_PRINT_U64(debug_enable, "oyi", offset_y_index_);
     offset_y_index_++;
 
     if (offset_y_index_ < offset_y_count_) {
+        DEBUG_PRINT_S(debug_enable, "next y");
+        DEBUG_PRINT_RANGE(debug_enable, "y base pre", offset_offset_y_base_);
         offset_offset_y_base_ += subres_layout_->rowPitch;
+        DEBUG_PRINT_RANGE(debug_enable, "y base post", offset_offset_y_base_);
         pos_ = offset_offset_y_base_;
+        DEBUG_PRINT_RANGE(debug_enable, "pos_ post next y", pos_);
     } else {
         offset_y_index_ = 0;
         arrayLayer_index_++;
         if (arrayLayer_index_ < layer_count_) {
+            DEBUG_PRINT_S(debug_enable, "next layer");
+            DEBUG_PRINT_RANGE(debug_enable, "layer base pre", offset_layer_base_);
             offset_layer_base_ += subres_layout_->arrayPitch;
+            DEBUG_PRINT_RANGE(debug_enable, "layer base post", offset_layer_base_);
             offset_offset_y_base_ = offset_layer_base_;
             pos_ = offset_layer_base_;
+            DEBUG_PRINT_RANGE(debug_enable, "pos_ post next layer", pos_);
         } else {
             arrayLayer_index_ = 0;
             mip_level_index_++;
             if (mip_level_index_ < mip_count_) {
+                DEBUG_PRINT_S(debug_enable, "next mip");
                 SetPos();
+                DEBUG_PRINT_RANGE(debug_enable, "pos_ post next mip", pos_);
             } else {
                 mip_level_index_ = 0;
                 aspect_index_ = encoder_->LowerBoundFromMask(subres_range_.aspectMask, aspect_index_ + 1);
                 if (aspect_index_ < aspect_count_) {
+                    DEBUG_PRINT_S(debug_enable, "next aspect");
                     SetPos();
+                    DEBUG_PRINT_RANGE(debug_enable, "pos_ post next aspect", pos_);
                 } else {
                     // End
                     pos_ = {0, 0};
+                    DEBUG_PRINT_RANGE(debug_enable, "pos_ post end", pos_);
                 }
             }
         }

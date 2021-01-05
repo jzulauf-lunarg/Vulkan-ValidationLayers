@@ -31,6 +31,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 TEST_F(VkLayerTest, BufferExtents) {
     TEST_DESCRIPTION("Perform copies across a buffer, provoking out-of-range errors.");
 
@@ -12951,3 +12952,4 @@ TEST_F(VkLayerTest, InvalidShadingRateUsage) {
         }
     }
 }
+#endif

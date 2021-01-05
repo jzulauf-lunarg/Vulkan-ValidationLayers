@@ -28,7 +28,7 @@ void VkBestPracticesLayerTest::InitBestPracticesFramework() {
     features_.pNext = &bp_settings;
     InitFramework(m_errorMonitor, &features_);
 }
-
+#if 0
 TEST_F(VkBestPracticesLayerTest, ValidateReturnCodes) {
     uint32_t version = SetTargetApiVersion(VK_API_VERSION_1_2);
     if (version < VK_API_VERSION_1_1) {
@@ -816,3 +816,4 @@ TEST_F(VkBestPracticesLayerTest, MissingQueryDetails) {
     vk::CreateDevice(phys_device_obj.handle(), &device_ci, nullptr, &device);
     m_errorMonitor->VerifyFound();
 }
+#endif

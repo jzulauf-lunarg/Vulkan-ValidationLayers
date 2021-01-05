@@ -106,6 +106,7 @@ class DuplicateMsgLimit {
     VkLayerSettingsEXT limit_setting;
 };
 
+#if 0
 TEST_F(VkLayerTest, VersionCheckPromotedAPIs) {
     TEST_DESCRIPTION("Validate that promoted APIs are not valid in old versions.");
     SetTargetApiVersion(VK_API_VERSION_1_0);
@@ -11313,3 +11314,4 @@ TEST_F(VkLayerTest, InvalidSpirvExtension) {
     pipe.CreateGraphicsPipeline();
     m_errorMonitor->VerifyFound();
 }
+#endif

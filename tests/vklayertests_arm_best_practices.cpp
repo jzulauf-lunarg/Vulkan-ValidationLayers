@@ -16,7 +16,7 @@
 #include "layer_validation_tests.h"
 
 // Tests for Arm-specific best practices
-
+#if 0
 TEST_F(VkArmBestPracticesLayerTest, TooManySamples) {
     TEST_DESCRIPTION("Test for multisampled images with too many samples");
 
@@ -941,3 +941,4 @@ TEST_F(VkArmBestPracticesLayerTest, ComputeShaderBadSpatialLocalityTest) {
     test_spatial_locality(pipe, compute_sampler_1d_64_1_1.GetStageCreateInfo(), false);
     test_spatial_locality(pipe, compute_sampler_2d_64_1_1.GetStageCreateInfo(), true);
 }
+#endif

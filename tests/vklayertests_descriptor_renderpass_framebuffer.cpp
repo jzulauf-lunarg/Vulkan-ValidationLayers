@@ -29,6 +29,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 TEST_F(VkLayerTest, ValidationArrayOOBRayTracingShaders) {
     TEST_DESCRIPTION(
         "Core validation: Verify detection of out-of-bounds descriptor array indexing and use of uninitialized descriptors for "
@@ -9103,3 +9104,4 @@ TEST_F(VkLayerTest, FramebufferDepthStencilResolveAttachmentTests) {
 
     vk::DestroyRenderPass(m_device->device(), renderPass, nullptr);
 }
+#endif

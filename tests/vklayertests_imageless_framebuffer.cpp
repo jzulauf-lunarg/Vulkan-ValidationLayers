@@ -29,6 +29,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 TEST_F(VkLayerTest, ImagelessFramebufferRenderPassBeginImageViewMismatchTests) {
     TEST_DESCRIPTION(
         "Begin a renderPass where the image views specified do not match the parameters used to create the framebuffer and render "
@@ -1594,3 +1595,4 @@ TEST_F(VkLayerTest, ImagelessFramebufferRenderPassBeginImageView3D) {
     vk::DestroyFramebuffer(m_device->device(), framebuffer, nullptr);
     vk::DestroyImageView(m_device->device(), imageView3D, nullptr);
 }
+#endif

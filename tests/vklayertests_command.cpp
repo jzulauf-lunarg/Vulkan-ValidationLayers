@@ -29,6 +29,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 TEST_F(VkLayerTest, InvalidCommandPoolConsistency) {
     TEST_DESCRIPTION("Allocate command buffers from one command pool and attempt to delete them from another.");
 
@@ -8772,3 +8773,4 @@ TEST_F(VkLayerTest, InvalidPrimitiveFragmentShadingRateWriteMultiViewportLimitDy
     m_commandBuffer->EndRenderPass();
     m_commandBuffer->end();
 }
+#endif

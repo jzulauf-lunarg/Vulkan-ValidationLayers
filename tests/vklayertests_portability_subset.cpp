@@ -26,6 +26,7 @@ class VkPortabilitySubsetTest : public VkLayerTest {
     }
 };
 
+#if 0
 TEST_F(VkPortabilitySubsetTest, ValidatePortabilityCreateDevice) {
     TEST_DESCRIPTION("Portability: CreateDevice called and VK_KHR_portability_subset not enabled");
 
@@ -686,3 +687,4 @@ TEST_F(VkPortabilitySubsetTest, ShaderValidation) {
         m_errorMonitor->VerifyFound();
     }
 }
+#endif

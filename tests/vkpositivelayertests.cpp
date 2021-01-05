@@ -39,6 +39,7 @@
 //
 // These tests do not expect to encounter ANY validation errors pass only if this is true
 
+#if 0
 TEST_F(VkPositiveLayerTest, TwoInstances) {
     TEST_DESCRIPTION("Create two instances before destroy");
 
@@ -10992,3 +10993,4 @@ void main() {
     pipe.CreateGraphicsPipeline();
     m_errorMonitor->VerifyNotFound();
 }
+#endif

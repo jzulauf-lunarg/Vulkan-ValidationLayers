@@ -33,6 +33,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 static VkInstance dummy_instance;
 
 TEST_F(VkLayerTest, InstanceExtensionDependencies) {
@@ -267,3 +268,4 @@ TEST_F(VkLayerTest, DestroyInstanceHandleLeak) {
     vk::DestroyInstance(instance, nullptr);
     Monitor().VerifyFound();
 }
+#endif

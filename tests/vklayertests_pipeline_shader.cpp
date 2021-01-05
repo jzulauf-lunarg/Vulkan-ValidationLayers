@@ -29,6 +29,7 @@
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
 
+#if 0
 TEST_F(VkLayerTest, PSOPolygonModeInvalid) {
     TEST_DESCRIPTION("Attempt to use invalid polygon fill modes.");
     VkPhysicalDeviceFeatures device_features = {};
@@ -10010,3 +10011,4 @@ TEST_F(VkLayerTest, GraphicsPipelineInvalidFlags) {
     flags = VK_PIPELINE_CREATE_RAY_TRACING_SHADER_GROUP_HANDLE_CAPTURE_REPLAY_BIT_KHR;
     CreatePipelineHelper::OneshotTest(*this, set_info, kErrorBit, "VUID-VkGraphicsPipelineCreateInfo-flags-03577");
 }
+#endif

@@ -27,7 +27,7 @@
 
 #include "cast_utils.h"
 #include "layer_validation_tests.h"
-
+#if 0
 TEST_F(VkSyncValTest, SyncBufferCopyHazards) {
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     if (DeviceExtensionSupported(gpu(), nullptr, VK_AMD_BUFFER_MARKER_EXTENSION_NAME)) {
@@ -2892,7 +2892,7 @@ TEST_F(VkSyncValTest, SyncEventsBufferCopy) {
     m_errorMonitor->VerifyFound();
     m_commandBuffer->end();
 }
-
+#endif
 TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
@@ -2921,28 +2921,39 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
     VkImageSubresourceLayers layers_1{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 1};
     VkImageSubresourceRange layers_0_subresource_range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     VkOffset3D zero_offset{0, 0, 0};
-    VkOffset3D half_offset{64, 64, 0};
+    // VkOffset3D half_offset{64, 64, 0};
     VkExtent3D full_extent{128, 128, 1};  // <-- image type is 2D
-    VkExtent3D half_extent{64, 64, 1};    // <-- image type is 2D
+    // VkExtent3D half_extent{64, 64, 1};    // <-- image type is 2D
 
     VkImageCopy full_region = {layers_all, zero_offset, layers_all, zero_offset, full_extent};
     VkImageCopy region_0_to_0 = {layers_0, zero_offset, layers_0, zero_offset, full_extent};
     VkImageCopy region_1_to_1 = {layers_1, zero_offset, layers_1, zero_offset, full_extent};
-    VkImageCopy region_0_q0toq0 = {layers_0, zero_offset, layers_0, zero_offset, half_extent};
-    VkImageCopy region_0_q0toq3 = {layers_0, zero_offset, layers_0, half_offset, half_extent};
-    VkImageCopy region_0_q3toq3 = {layers_0, half_offset, layers_0, half_offset, half_extent};
+    // VkImageCopy region_0_q0toq0 = {layers_0, zero_offset, layers_0, zero_offset, half_extent};
+    // VkImageCopy region_0_q0toq3 = {layers_0, zero_offset, layers_0, half_offset, half_extent};
+    // VkImageCopy region_0_q3toq3 = {layers_0, half_offset, layers_0, half_offset, half_extent};
 
     auto cb = m_commandBuffer->handle();
-    auto copy_general = [cb](const VkImageObj &from, const VkImageObj &to, const VkImageCopy &region) {
+    auto WIP_TRACE = [](const char *tag) {
+        printf("WIP_TRACE: %s\n", tag);
+        fflush(stdout);
+    };
+    auto copy_general = [cb, &WIP_TRACE](const VkImageObj &from, const VkImageObj &to, const VkImageCopy &region) {
+        WIP_TRACE("CG.pre");
         vk::CmdCopyImage(cb, from.handle(), VK_IMAGE_LAYOUT_GENERAL, to.handle(), VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        WIP_TRACE("CG.post");
     };
 
-    auto set_layouts = [this, &image_a, &image_b, &image_c]() {
+    auto set_layouts = [this, &image_a, &image_b, &image_c, WIP_TRACE]() {
+        WIP_TRACE("SL.pre");
         image_c.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        WIP_TRACE("SL.postC");
         image_b.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        WIP_TRACE("SL.postB");
         image_a.SetLayout(m_commandBuffer, VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_GENERAL);
+        WIP_TRACE("SL.postA");
     };
 
+#if 0
     // Scope check.  One access in, one access not
     m_commandBuffer->begin();
     set_layouts();
@@ -2954,9 +2965,13 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
                                 nullptr, 0, nullptr);
     copy_general(image_c, image_a, region_0_q0toq0);
     m_errorMonitor->VerifyNotFound();
+    WIP_TRACE("10");
+
     m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_READ");
     copy_general(image_c, image_a, region_0_q0toq3);
     m_errorMonitor->VerifyFound();
+    WIP_TRACE("20");
+
     m_commandBuffer->end();
 
     // WAR prevented
@@ -2971,11 +2986,14 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
                                 nullptr, 0, nullptr);
     copy_general(image_c, image_a, full_region);
     m_errorMonitor->VerifyNotFound();
+    WIP_TRACE("30");
 
     // Wait shouldn't prevent this WAW though, as it's only a synchronization barrier
     m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
     copy_general(image_c, image_b, full_region);
     m_errorMonitor->VerifyFound();
+    WIP_TRACE("40");
+
     m_commandBuffer->end();
 
     // Prevent WAR and WAW
@@ -2995,8 +3013,11 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
     // The WAR should also be safe (on a sync barrier)
     copy_general(image_c, image_a, full_region);
     m_errorMonitor->VerifyNotFound();
-    m_commandBuffer->end();
+    WIP_TRACE("50");
 
+    m_commandBuffer->end();
+#endif
+    WIP_TRACE("50.10");
     // Barrier range check for WAW
     auto image_barrier_region0_waw = LvlInitStruct<VkImageMemoryBarrier>();
     image_barrier_region0_waw.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -3010,21 +3031,33 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
 
     // Region 0 safe, back WAW
     m_commandBuffer->reset();
+    WIP_TRACE("50.20");
     m_commandBuffer->begin();
+    WIP_TRACE("50.30");
     set_layouts();
+    WIP_TRACE("50.40");
     m_errorMonitor->ExpectSuccess();
+    WIP_TRACE("50.50");
     copy_general(image_a, image_b, full_region);
+    WIP_TRACE("50.60");
     m_commandBuffer->SetEvent(event, VK_PIPELINE_STAGE_TRANSFER_BIT);
+    WIP_TRACE("50.70");
     m_commandBuffer->WaitEvents(1, &event_handle, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, nullptr, 0,
                                 nullptr, 1, &image_barrier_region0_waw);
+    WIP_TRACE("50.80");
     copy_general(image_a, image_b, region_0_to_0);
+    WIP_TRACE("50.90");
     m_errorMonitor->VerifyNotFound();
+    WIP_TRACE("60");
+
     m_errorMonitor->SetDesiredFailureMsg(VK_DEBUG_REPORT_ERROR_BIT_EXT, "SYNC-HAZARD-WRITE_AFTER_WRITE");
     copy_general(image_a, image_b, region_1_to_1);
     m_errorMonitor->VerifyFound();
+    WIP_TRACE("70");
+
     m_commandBuffer->end();
 }
-
+#if 0
 TEST_F(VkSyncValTest, SyncEventsCommandHazards) {
     TEST_DESCRIPTION("Check Set/Reset/Wait command hazard checking");
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
@@ -3094,3 +3127,4 @@ TEST_F(VkSyncValTest, SyncEventsCommandHazards) {
 
     m_commandBuffer->end();
 }
+#endif

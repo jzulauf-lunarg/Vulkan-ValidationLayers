@@ -37,6 +37,7 @@ bool VkGpuAssistedLayerTest::InitGpuAssistedFramework(bool request_descriptor_in
     return false;
 }
 
+#if 0
 TEST_F(VkGpuAssistedLayerTest, GpuValidationArrayOOBGraphicsShaders) {
     TEST_DESCRIPTION(
         "GPU validation: Verify detection of out-of-bounds descriptor array indexing and use of uninitialized descriptors.");
@@ -2292,3 +2293,4 @@ TEST_F(VkDebugPrintfTest, MeshTaskShadersPrintf) {
     ASSERT_VK_SUCCESS(err);
     m_errorMonitor->VerifyFound();
 }
+#endif
