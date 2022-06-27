@@ -4333,6 +4333,7 @@ TEST_F(VkSyncValTest, StageAccessExpansion) {
 }
 
 TEST_F(VkSyncValTest, SyncQSBufferCopyHazards) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework(true));  // Enable QueueSubmit validation
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
 
