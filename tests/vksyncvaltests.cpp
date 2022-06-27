@@ -1985,6 +1985,7 @@ TEST_F(VkSyncValTest, SyncCmdQuery) {
 }
 
 TEST_F(VkSyncValTest, SyncCmdDrawDepthStencil) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
     m_errorMonitor->ExpectSuccess();
@@ -2142,6 +2143,7 @@ TEST_F(VkSyncValTest, SyncCmdDrawDepthStencil) {
 
 
 TEST_F(VkSyncValTest, RenderPassLoadHazardVsInitialLayout) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     bool do_none_load_op_test = false;
     if (DeviceExtensionSupported(gpu(), nullptr, VK_EXT_LOAD_STORE_OP_NONE_EXTENSION_NAME)) {
@@ -2244,6 +2246,7 @@ TEST_F(VkSyncValTest, RenderPassLoadHazardVsInitialLayout) {
 }
 
 TEST_F(VkSyncValTest, SyncRenderPassWithWrongDepthStencilInitialLayout) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState());
     if (IsPlatform(kNexusPlayer)) {
@@ -2371,6 +2374,7 @@ TEST_F(VkSyncValTest, SyncRenderPassWithWrongDepthStencilInitialLayout) {
 }
 
 TEST_F(VkSyncValTest, SyncLayoutTransition) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState());
     if (IsPlatform(kNexusPlayer)) {
@@ -2575,6 +2579,7 @@ TEST_F(VkSyncValTest, SyncLayoutTransition) {
 }
 
 TEST_F(VkSyncValTest, SyncSubpassMultiDep) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState());
     if (IsPlatform(kNexusPlayer)) {
@@ -2817,6 +2822,7 @@ TEST_F(VkSyncValTest, SyncSubpassMultiDep) {
 }
 
 TEST_F(VkSyncValTest, RenderPassAsyncHazard) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState());
 
@@ -3201,6 +3207,7 @@ TEST_F(VkSyncValTest, RenderPassAsyncHazard) {
 }
 
 TEST_F(VkSyncValTest, SyncEventsBufferCopy) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Check Set/Wait protection for a variety of use cases using buffer copies");
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
@@ -3300,6 +3307,7 @@ TEST_F(VkSyncValTest, SyncEventsBufferCopy) {
 }
 
 TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
+    GTEST_SKIP() << "Bisection WIP skip";
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
 
@@ -3432,6 +3440,7 @@ TEST_F(VkSyncValTest, SyncEventsCopyImageHazards) {
 }
 
 TEST_F(VkSyncValTest, SyncEventsCommandHazards) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Check Set/Reset/Wait command hazard checking");
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
     ASSERT_NO_FATAL_FAILURE(InitState(nullptr, nullptr, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT));
@@ -3550,6 +3559,7 @@ TEST_F(VkSyncValTest, SyncEventsCommandHazards) {
 }
 
 TEST_F(VkLayerTest, CmdWaitEvents2KHRUsedButSynchronizaion2Disabled) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Using CmdWaitEvents2KHR when synchronization2 is not enabled");
     SetTargetApiVersion(VK_API_VERSION_1_3);
 
@@ -3583,6 +3593,7 @@ TEST_F(VkLayerTest, CmdWaitEvents2KHRUsedButSynchronizaion2Disabled) {
 }
 
 TEST_F(VkLayerTest, Sync2FeatureDisabled) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Call sync2 functions when the feature is disabled");
 
     SetTargetApiVersion(VK_API_VERSION_1_3);
@@ -3675,6 +3686,7 @@ TEST_F(VkLayerTest, Sync2FeatureDisabled) {
 }
 
 TEST_F(VkSyncValTest, DestroyedUnusedDescriptors) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Verify unused descriptors are ignored and don't crash syncval if they've been destroyed.");
     SetTargetApiVersion(VK_API_VERSION_1_1);
     AddRequiredExtensions(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
@@ -3910,6 +3922,7 @@ TEST_F(VkSyncValTest, DestroyedUnusedDescriptors) {
 }
 
 TEST_F(VkSyncValTest, TestInvalidExternalSubpassDependency) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Test write after write hazard with invalid external subpass dependency");
 
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
@@ -4035,6 +4048,7 @@ TEST_F(VkSyncValTest, TestInvalidExternalSubpassDependency) {
 }
 
 TEST_F(VkSyncValTest, TestCopyingToCompressedImage) {
+    GTEST_SKIP() << "Bisection WIP skip";
     TEST_DESCRIPTION("Copy from uncompressed to compressed image with and without overlap.");
 
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
@@ -4158,6 +4172,7 @@ TEST_F(VkSyncValTest, TestCopyingToCompressedImage) {
 }
 
 TEST_F(VkSyncValTest, StageAccessExpansion) {
+    GTEST_SKIP() << "Bisection WIP skip";
     SetTargetApiVersion(VK_API_VERSION_1_2);
 
     ASSERT_NO_FATAL_FAILURE(InitSyncValFramework());
