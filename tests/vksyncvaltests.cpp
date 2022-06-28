@@ -4564,10 +4564,12 @@ QSTestContext::QSTestContext(VkDeviceObj* device) {
                 break;
             }
         }
-        if (q1 != VK_NULL_HANDLE) {
+        if (Valid()) {
             break;
         }
     }
+
+    if (!Valid()) return;
 
     VkMemoryPropertyFlags mem_prop = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
     buffer_a.init_as_src_and_dst(*device, 256, mem_prop);
