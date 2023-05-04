@@ -1,5 +1,5 @@
 <!-- markdownlint-disable MD041 -->
-<!-- Copyright 2015-2022 LunarG, Inc. -->
+<!-- Copyright 2015-2023 LunarG, Inc. -->
 [![Khronos Vulkan][1]][2]
 
 [1]: https://vulkan.lunarg.com/img/Vulkan_100px_Dec16.png "https://www.khronos.org/vulkan/"
@@ -647,6 +647,7 @@ The ResourceAccessState is the leaf level structure at which the synchronization
     This test compares a stage/access against a resource access state.
 
     *   For read access
+        
         *   If there is a write recorded, test  stage/access flag vs. write barriers.  If there is no write barrier for stage/access, report RAW hazard
     *   For write access
         *    If there have been read accesses since the last write,  test each per-stage read record, if any read does not have a barrier for the write access stage, report WAR hazard.
@@ -1427,3 +1428,200 @@ If depthTestEnable is TRUE, otherwise, any, since with depth testing disabled th
 ### Host Synchronization commands
 
 **TODO/KNOWN LIMITATION:** Host synchronization not supported in phases 1 and 2.
+
+
+
+
+
+## Aliasing Support WIP Design
+
+Vulkan does not restrict device memory to be bound to only a single resource (buffer or image), but has the following restrictions as to when memory multiply bound and be interpreted in consistent ways.
+
+> Buffers, and linear image subresources in either the VK_IMAGE_LAYOUT_PREINITIALIZED or VK_IMAGE_LAYOUT_GENERAL layouts, are host-accessible subresources.
+>
+> ...
+>
+> If two aliases are both host-accessible, then they interpret the contents of the memory in consistent ways, and data written to one alias can be read by the other alias.
+
+> If two aliases are both images that were created with identical creation parameters, both were created with the VK_IMAGE_CREATE_ALIAS_BIT flag set, and both are bound identically to memory, ..., then they interpret the contents of the memory in consistent ways, and data written to one alias can be read by the other alias.
+
+When memory can be interpreted a consistent way, hazard detection, and state update can be done equivalently from all consistent aliases.  However, when consistent interpretation is not possible, accesses to any address in one bound resource must be interpreted as impacting *every* address in the aliased region.  If one does not know the organization of a resource, the effect must be treated as if they apply to the entire bound region.
+
+This violates some assumptions of the non-aliased model in the following ways:
+
+1) that a single *idealized* mapping of tiled (opaque) image resources for a given binding range is sufficient
+
+2) that only a single, most recent write and barrier state is sufficient to characterize the `ResourceAccessState`
+
+3) that only a single, most recent read per stage is sufficient to characterize the `ResourceAccessState`
+
+These all arise from the need to integrate the read, write, and synchronization operations over the entire bound range into a single, pessimistic `ResourceAccessState` reflecting the accesses and barriers defining the potential hazards.
+
+
+
+### Memory Model
+
+To support hazard detection between Linear and Idealized accesses, the current segregation of the access to Linear and Idealized `ResourceAccessRangeMap` objects needs to be abandoned. (Note the term Idealized refers to the mapping of tiled images to byte addresses using a simplified interpretation, not reflecting what any real implementation necessarily would use, but valid for the image size and format.)  Instead, resources (specifically tiled images) will have two distinct base addresses in the `ValidationStateTracker::fake_memory` space, a Linear binding and an Idealized binding.  The Linear binding is shared across all resource with the same `VkDeviceMemory`. The Idealized binding is shared across all tiled images that have a consistent memory interpretation (a Consistent Alias Group).  All tiled images belong to a group of at least the image itself, with a unique fake base address for the Idealized binding.
+
+The effect of operations for the various resources:
+
+| Binding   | Buffers/Linear Images                   | Tiled Images                                                 |
+| --------- | --------------------------------------- | ------------------------------------------------------------ |
+| Linear    | accesses affect byte-accurate locations | access at any location touches entire bound region           |
+| Idealized | N/A                                     | accesses affect byte accurate location of "idealized" layout, limited to consistent aliases |
+
+Tiled images will have address ranges reserved for their Idealized binding uniquely mapped to all consistent aliases of a given `VkDeviceMemory` range.  It is possible that multiple inconsistent tiled images may be mapped to the same `VkDeviceMemory` Thus, a given device memory range may map in a 1-N relationship to Idealized bindings.  Hazard detection between *inconsistent* memory aliases is performed based on the Linear binding, comprising the entire bound range.
+
+Memory Example:
+
+To understand this better, consider a single device memory allocation ***M***  of size 512 with the following allocations bound to it:
+
+| Type             | Name     | Bound Range | Notes                    |
+| ---------------- | -------- | ----------- | ------------------------ |
+| Buffer (liinear) | ***B***  | [0, 512)    |                          |
+| Image (Tiled)    | ***I0*** | [128, 256)  |                          |
+| Image (Tiled)    | ***I1*** | [128, 256)  | Consistent with ***I1*** |
+| Image (Linear)   | ***I2*** | [128, 384)  |                          |
+
+The resources can be thought mapping to memory in three ways --  within the allocation, in relation to other consistent aliases, and within the `ValidationStateTracker::fake_memory` used to simplify storage.  Note the with the aliasing, the idealized representation no longer are tracking in a separate `AddressType` but within it's own allocation in `ValidationStateTracker::fake_memory`.
+
+<img src="images/sync_alias_example_1.svg" alt="sync_alias_example_1" width=150% />
+
+These three representations are needed to model the read (r) and write (w) accesses shown below.
+
+<img src="images/sync_alias_example1_ops.svg" alt="sync_alias_example1_ops" width=200% />
+
+The effect of each operation is shown above.  Accesses to linear resources (w<sub>c</sub> and r<sub>d</sub>) are tracked in a byte accurate way within ***M***.  Likewise, accesses to non-linear, tiled resources (w<sub>a</sub> and r<sub>b</sub>) are tracked in a bytewise *consistent* way within ***A0***. Since the actual organization of tiled images is arbitrary, any arbitrary, consistent representation can be used within ***A0*** for accurate synchronization validation, even though it may not reflect any implementation. Because the memory organization is arbitrary for tiled images, any pixel could exists at any address within the linear bound range.  Accesses to any portion of a non-linear image must be treated (for purposes of validation) as accesses to all bytes within the bound range -- "any access affects all locations". The linear representation of a set of accesses is the union of accesses found within the idealized representation. The Idealized representation allows for byte accurate hazard detection between consistent aliases of the same memory range.  The linear representation allows for byte accurate hazard detection between linear resources (buffers and non-tiled images), a between non-linear resources and/or between linear and non-linear resources.  
+
+We can see the usage of the various representation for hazard detection between the above operations.
+
+| Access pair <br/>(before, after) | Idealized | Linear | Comments |
+| -------- | ---- | -------- | -------- |
+| w<sub>a</sub>, r<sub>b</sub> | No hazard | N/A | Since a consistent interpretation is possible (***A0***), only that representation need be tested. |
+| w<sub>a</sub>, w<sub>c</sub> | N/A | WAW | w<sub>a</sub> must be considered to affect the entire bound range, thus the portion of w<sub>c</sub> overlapping I1 constitutes a hazard |
+| w<sub>a</sub>, r<sub>d</sub> | N/A | RAW | the portion of r<sub>d</sub> overlapping constitutes a hazard for the same reason |
+| r<sub>b</sub>, r<sub>d</sub> | N/A | No hazard | r<sub>b</sub> and r<sub>d</sub> pose no hazard as they are both reads, regardless of representation |
+| w<sub>c</sub>, r<sub>d</sub> | N/A | No hazard | As w<sub>c</sub> and r<sub>d</sub> are known at byte accuracy within *M* and do not overlap they do not hazard. |
+| w<sub>c</sub>, r<sub>b</sub> | N/A | RAW | r<sub>b</sub> must be considered to affect the entire bound range, thus the portion of w<sub>c</sub> overlapping I1 constitutes a hazard |
+
+Were ***I2*** to be tiled instead of linear, an additional representation ***A1*** would be needed to provided a consistent interpretation for operations involving ***I2*** with itself. Also in that case the  (w<sub>c</sub>, r<sub>d</sub>) access pair *would* constitute a hazard, given the same "any access affects all locations" logic applied to operations in ***A1***.
+
+### Consistent Alias Group
+
+#### Access tagging 
+
+The Consistent Alias Group represents any number of images which satisfy the aliasing criteria for non-linear (tiled) images.  The are denoted by a unique id (`AliasID`), likely represented by strictly increasing integer. New `AliasID` values are created each time a novel Consistent Alias Group is created, regardless of memory aliasing or reuse. When an `AliasID` is created, a range of ValidationStateTracker::fake_memory is allocated to represent the Idealized binding.  This allows for a unified access map, obviating the need for separate Linear and Idealized address spaces.  The second base address (the `idealized_base_address`) would be stored on a per image (see `SyncValImageState` below).There is a 1-1 mapping of `AliasID` to Idealized binding base address.  Non-aliased images are also assigned a `AliasID`, as they represent a "group" of one, which can be use in the integrated `ResourceAccessState`.  Each read and write access in the integrated state (see below) must be tagged with the `AliasID`.
+
+The `AliasID` of `AliasID::kLinear` is reserved for all resources that are linearly mapped (buffers, non-tiled images).
+
+***Note:*** *One could make the `AliasID` and `idealized_base_address` synonymous, at the cost of require the `AliasID` to be the size of `VkDeviceMemory`.   (doubling the impact on the `ResourceAccessState` size).*
+
+#### `AliasID`Creation
+
+`AliasID` values are allocated during `BindImageMemory` and `CreateSwapchain` calls.  The `AliasID` is assign to an Image at `BindImageMemory`  and`CreatImage` calls depending on whether the image is bound to a`VkDeviceMemory` or `VkSwapchain` respectively.  
+
+#### Optimization
+
+The most common scenario for memory usage is non-aliased.  As memory aliasing can be detected at memory bind time, the "integrate/update" phase can be both disabled and deferred when no inconsistent aliases exist.  This information can be tracked at the `VkBuffer`/`VkImage` state level. 
+
+#### Layer Derived Classes
+
+To facilitate storage of `AliasID`, `has_inconsistent_alias`, and `idealized_base_address` information for a given image, the IMAGE_STATE needs to be derived with a child `SyncValImageState` class.
+
+### Integrated State
+
+The contents of the bound range of a tiled (non-linear) resource reflects an integration of all access/barrier operation found with the Idealized binding. This integrated state updates the entire Linear binding for the resource. It reflects all read, write, and synchronization operations.  The integration is lossy, as the specific subresource and pixel information of a given access is not retained, only it's existence *somewhere* within the Idealized binding.  As such, the Linear binding update for tiled image resource cannot be incremental. The integration operation must be repeated for the whole of the Idealized binding, and applied to the entire Linear binding. 
+
+The integrated state is constructed by traversing all `ResourceAccessState` object within the Idealized binding.  All unique read and write operations (stage/access/tag) are retained in the integrated state (both for current and first access information).  To preserve the WAW detection logic ignoring WAW testing when intervening reads are present, as a "has_reads" flag read which is `true` IFF all references to a write/tag pair in the integrated range have intervening reads. For each unique read or write operation (stage/access/tag) the effective barrier and ordering rules are the intersection of the barriers and ordering rules (see **Note:**) of all references to the unique operation within the integrated range.
+
+**Note:** `enum class SyncOrdering` is already (incidentally) a bit mask for `kColorAttachment`, `kDepthStencilAttachment`, and `kRaster`. This allows easy intersection of the ordering rules bitwise. This needs to be documented in the definition of of the `SyncOrdering`.
+
+
+
+### Hazard Detection
+
+For buffers and linear images, hazard detection is unchanged relative to pre-aliasing support.  Accesses are validated against the Linear address `VkDeviceMemory` range affected.  The effect of inconsistent memory alias access, if any, is recorded in the Linear binding by the update mechanism noted below.
+
+For tiled images every hazard detection and update operation now must be performed in against both Linear and Idealized bindings. Hazard detection is first performed against the image itself (including the consistent aliases). The hazard check is done on the exact Idealized memory location of the access or barrier operation. The second hazard check applies the same access or barrier, but against the entire Linear binding. Since the mapping of tiled image to Linear addresses is unknown, every access is considered to conflict with the entire bound Linear range.  During this check the Linear `ResourceAccessState` information reflecting accesses *consistent* with the tiled image must be ignored.  This requirement means that accesses must be tagged with an the `AliasID`. (Each read and write state.)
+
+For all resource accesses, hazard detection must change to reflect the possibility of more than a single write operation or more than a single read operation per stage, in a given `ResourceAccessState` (resulting from Integration above).
+
+
+
+### Updates to ResourceAccessState
+
+#### Storage
+
+The `ResourceAccessState` needs the following additional information
+
+| Item              | Update                                                       |
+| ----------------- | ------------------------------------------------------------ |
+| Write information | Encapsulate all write information into a `WriteState` structure and store as `small_vector` of size 1.  Allow multiple write entries unique on `WriteState::access/WriteState::tag` |
+| `WriteState`      | Add `bool has_reads` (or reads_since stage/access mask) and  `AliasID alias_id` |
+| `ReadState`       | Add `AliasID alias_id`                                       |
+| `last_reads`      | Treat read stage as potentially non-unique, for integrated instances.  `ReadState::access/ReadState::tag` should be unique. |
+
+#### Update (from usage)
+
+Updates of `ResourceAccessState` needs to be modified to include the `AliasID` of the access in addition to the usage and tag information.  Updates for read stages with extant `ReadState`entries only update reads with the matching `AliasID` and pipeline stage.  Writes reset the` ResourceAccessState` to reflect the write usage regardless of `AliasID`.
+
+#### Update (from Integrated `ResourceAccessState`)
+
+When updating the Linear binding associated with an Idealized binding update, the integrated access state is applied to the entire binding range.  This operation differs for read and write operations.
+
+ For updates associated with read operations, only the read stages of the Linear binding entry matching the `AliasID` are updated from the the integrated state.  If the last write operation of the Linear binding entry has the same `AliasID` as the integrated access state, all of the integrated access state matching the `AliasID` of the access are updated, with new read entries added.  However, if the last write `AliasID` of the Linear binding entry does not match the `AliasID` of the integrated access state, then only read elements with tags greater than the last write tag are updated, and/or added. (most recent access logic).   
+
+If the update is associate with a write operation, the integrated state *replaces* all state information in the linear address range. This implies that even when more than one write operation is present, all write operations always have the same `AliasID` . We could save storage by not including an `AliasID` in the per write state.
+
+#### Barrier
+
+Barriers are applied regardless of `AliasID`. Barrier treatment varies by type of barrier.
+
+| Barrier Type       | Barrier Application                                          |
+| ------------------ | ------------------------------------------------------------ |
+| **Memory**         | Applied to all ranges, regardless of binding type (Linear vs. Idealized).  No integration/update from the Idealized bindings to Linear bindings are required. |
+| **Buffer**         | Applied to Linear binding of buffer.  Applied to any Idealized binding which is fully covered by the buffer region. No integration/update from the Idealized binding is required. |
+| **Image (linear)** | Applied to Linear binding of image. Applied to any Idealized binding which is fully covered by any contiguous range affected.   No integration/update from Idealized binding is required. |
+| **Image (tiled)**  | Applied to Idealized Binding. Integration/update from Idealized *is* required. Barrier hazard detection needs to be performed against Linear binding in the case of Image Layout Transitions.  Since the source stage/access scope is only known to apply to the image, (and the image may not occupy every byte of the binding), the barrier hazard check is against all accesses not matching the `AliasID` of the image barrier without apply the source stage/access barrier. (i.e. only not a hazard if no accesses not matching `AliasID` are present in the Linear binding) |
+
+#### Resolve
+
+The updated resolve logic (for used combining parallel `AccessContext` graphs)
+
+| Rule               | Action (for equal stage/access)                              |
+| ------------------ | ------------------------------------------------------------ |
+| Newer write tag    | Only the state information from the `ResourceAccessState` is conserved. Note that due to update operations all retained writes (if more than one) are from the same `AliasID`.<br/><br/>As with the existing logic, read operations of the ignored state are dropped, even if newer than the conserved write operation.  This reflects the MRA logic that data can be lost IFF a) that data would have generated a hazard and b) that such loss would not exist if the hazard was eliminated. |
+| Equal read tag     | The barriers are the union of the barriers of the two access states |
+| Differing read tag | Conserve both (this affects both aliased and non-aliased operations, will need to test for false positives) |
+
+   
+
+#### Detect Hazard
+
+##### Current Usage
+
+As hazard detection of the Linear binding requires additional scoping to avoid false positives against the `AliasID` corresponding to the updated tiled image.  `ResourceAccessContext::DetectHazard` member functions will require addition of an `AliasID` argument when they are performed on Linear bindings.
+
+As only accesses consistent with the recorded `AliasID` are present in the Idealized binding, no additional scope test is needed for hazard detection on Idealized bindings.  However, when detecting hazard conditions from accesses to non-tiled resources, no accesses within the Linear binding are ignored.
+
+***Implementation Idea:*** As opposed to having a flag controlling "ignore" behavior, simply passing an `AliasID ignore_id` argument, with a `AliasID::kInvalid` defined that is never used (effective disabling the `AliasID` masking).
+
+***Note:*** *we may want to reduce the number of implementations of `DetectHazard` member to the most general case for maintenance reason, specifically if this same change/scoping test would have to be added to multiple specialized forms, some of which logically reduce to one another. That or find some refactoring s.t. the permutations of scope and ordering tests do not require the same number of variants.*
+
+##### Recorded Usage
+
+The `DetectHazard` taking recorded usage (in the `DetectFirstUseHazard` path) will also need modification to 
+
+* Accept argument to specific the scope rule used for Idealized or Linear binding (***Note:*** *likely need to tag all `ResourceAccessStates` with Linear/Idealized boolean*)
+* Pass extracted recorded `AliasID` and scope rule information from first use information to underlying `DetectHazard` overrides. 
+
+### AccessContext Updates
+
+There are several `AccessContext::DetectHazard` member that apply to images.  Theses differ by hazard detection functors use, and the parameter to the range generators.  Eventually all of these call into the generic AccessContext::DetectHazard operating on a single range.  In order to avoid duplication of the aliasing logic, each of these need to be modified to supply a range generation object factory callable encapsulating the member specific range generation function arguments and creation, and taking the object base address as an argument.
+
+A unified `DetectHazard<Detector, RangeGenFactory>(Detector &, RangeGenFactory &, const SyncValImageState &)` function will identify the need for alias detection (when the SyncValImageState::alias_id is not  `AliasID::kLinear`).  In order to support DetectImageBarrierHazard the `Detector` concept will need to include an `AliasDetector` method which returns a (reference) to a Detector compatible with detection of the tiled access with the `kLinear` representation. 
+
+The `UpdateAccessState` functions supporting image operation, will need a similar refactor to the `DetectHazard` call.
+
+
+
