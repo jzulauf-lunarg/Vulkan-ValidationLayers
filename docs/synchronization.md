@@ -138,13 +138,12 @@ Memory access is characterized by the _memory extent_ and _memory usage_.  Memor
 
 ### Memory Address Space
 
-To simplify tracking and updating the state of memory extents as listed below, state is stored in a consistent way for all resource types. Also, to eliminate needing to define separate address spaces for each device memory allocations, VkMemory are placed at “fictitious” base addresses (FBA) within a global address space using a simple “next available” allocation scheme. (Which is robust for all rational Vulkan usage models for months of runtime.) However, because the actual memory organization of certain resources is opaque, the tracking is divided into Linear and Ideal extents which exist in independent spaces.  
+To simplify tracking and updating the state of memory extents as listed below, state is stored in a consistent way for all resource types. Also, to eliminate needing to define separate address spaces for each device memory allocations, VkMemory are placed at “fake” base addresses (FBA) within a global address space using a simple “next available” allocation scheme. (Which is robust for all rational Vulkan usage models for months of runtime.) Additionally, because the actual memory organization of certain resources is opaque, an "opaque range" is allocated with an independent FBA to the extent needed to hold the Synchronization Validation internal representation of these opaque resources.   This FBA allocation will be referred to 
 
 
 ### Memory Extent Definitions and Comparisons
 
 Memory extent can be specified in a variety of ways:
-
 
 <table>
   <tr>
@@ -162,7 +161,7 @@ Memory extent can be specified in a variety of ways:
   <tr>
    <td>Tiled (opaque) image subresource range
    </td>
-   <td>A VkImage handle to an opaque (optimal tiling) image with a VkSubresourceRange which cannot be mapped to a specific subset of the the <code>VkMemory </code>bound to the <code>VkImage</code>.  The subresources are encoded to the  “Idealized” memory range, specific to the image creation parameters which can only be compared relative to “compatible” aliases.  Otherwise all subresources within the range are assumed to alias to *every* device memory address bound to the image.
+   <td>A VkImage handle to an opaque (optimal tiling) image with a VkSubresourceRange which cannot be mapped to a specific subset of the the <code>VkMemory </code>bound to the <code>VkImage</code>.  The subresources are encoded to the opaque range reserved for the resource, specific to the image creation parameters which can only be compared relative to “compatible” aliases.  Otherwise all subresources within the range are assumed to alias to *every* device memory address bound to the image.
    </td>
   </tr>
   <tr>
@@ -174,8 +173,8 @@ Memory extent can be specified in a variety of ways:
 </table>
 
 
-These distinctions affect the ability of memory references to be compared w.r.t. “overlap” --
 
+These distinctions affect the ability of memory references to be compared w.r.t. “overlap” --
 
 <table>
   <tr>
@@ -215,10 +214,11 @@ These distinctions affect the ability of memory references to be compared w.r.t.
    </td>
    <td>
    </td>
-   <td>For “compatible*” tiled images, compare encoded “idealized” memory ranges.  For incompatible images, every subresource is assumed to alias to any subresource in the other image.
+   <td>For “compatible*” tiled images, compare encoded opaque ranges.  For incompatible images, every subresource is assumed to alias to any subresource in the other image.
    </td>
   </tr>
 </table>
+
 
 
 * Compatible tiled images are those with same image resource handle, or with the same image create info with `VK_IMAGE_CREATE_ALIAS_BIT `set and the same memory handle binding offset.
@@ -230,7 +230,7 @@ For incompatible memory extent types any overlap of the bound range must be assu
 
 Several of the lookups below require tracking and comparing non-unique collections of intervals (memory binding range, mip levels or slices in a subresource).  To compress storage improve traversal of the access state these intervals are stored in non-overlapping interval trees -- effectively a run-length compression for ranges of memory addresses over which the state is constant.
 
-The implementation used is a wrapper to std::map (which is typically implemented as a red-black tree), that implements a non-overlapping 1 dimensional range map.  Conversion to and from subresource address space is performed by a “encoder”/”generator” classes the create a set of single-dimensional ranges from subresource range definitions.  For buffer and linear images, the index for the interval tree represents  device memory in an idealized/simplified memory allocation scheme for VkDeviceMemory allocations.  For tiled/opaque images, the index represents an idealized memory range, not corresponding to device memory in any way.
+The implementation used is a wrapper to std::map (which is typically implemented as a red-black tree), that implements a non-overlapping 1 dimensional range map.  Conversion to and from subresource address space is performed by a “encoder”/”generator” classes the create a set of single-dimensional ranges from subresource range definitions.  For buffer and linear images, the index for the interval tree represents  device memory in an simplified memory allocation scheme for VkDeviceMemory allocations.  For tiled/opaque images, the index represents an opaque memory range, not corresponding to device memory in any way.
 
 ### VK_KHR_synchronization2
 
@@ -493,7 +493,7 @@ A marker representing a specific access for error reporting or sequence specific
 
 #### ResourceAccessState
 
-The specific access/barrier state for a given extent of memory (or idealized memory) addresses. The ResourceAccessState reflects the common state of a single contiguous range of memory addresses.
+The specific access/barrier state for a given extent of memory (or opaque range) addresses. The `ResourceAccessState` reflects the common state of a single contiguous range of memory addresses.
 
 Stores:
 
@@ -532,14 +532,12 @@ ResourceAccessState and dependency information for a given “context” (for ex
 
 Stores:
 
-*   Idealized address space ResourceAccessRangeMap
-*   Linear address space ResourceAccessRangeMap
+*   "Fake"address space ResourceAccessRangeMap
 *   Subpass dependency and barrier information (for traversal within renderpass instances) if needed.
 
 Implements:
 
 *   Hazard detection traversal over (potentially discontiguous) ranges for images and buffers
-*   Resource addressing (linear/idealized) type resolution
 *   VkMemory FBA offset
 *   State update traversal over (potentially discontiguous) ranges for images and buffers
 *   Subpass dependency graph traversal for state lookup and resolution operations (including support  for RenderPass specific and Hazard detection operations)
@@ -585,7 +583,7 @@ Accesses within a QueueBatchContext are tagged with "global" (at device scope) R
 
 ### Range Based Operations
 
-In the discussion below, validation or update of the state of resource is discussed as if it is a uniform, singular operation.  However, over the input range of a memory access or synchronization operation the resource access state can vary.  For images, the input range may even be discontinuous, covering a series of locally contiguous ranges (in linear or ideal address space).
+In the discussion below, validation or update of the state of resource is discussed as if it is a uniform, singular operation.  However, over the input range of a memory access or synchronization operation the resource access state can vary.  For images, the input range may even be discontinuous, covering a series of locally contiguous ranges (mapping to `VkDeviceMemory` or opaque range addresses).
 
 All resource access state operations described below happen over ranges over which the input and current access state values are constant.  As such, top-level operations (such as hazard detection for the use a of memory range in a copy operation), are implemented using range traversal functions to hide the complexity of the underlying variability in current state. Return values from certain query operations (like those needed for “resolve” operations below) are not single valued but are ResourceAccessRangeMap objects reflecting the set of range/value pairs in the query range.  State update operations also must deal with the potential of a non-constant current state over the range, range boundary misalignment, or gaps in current state, requiring record splitting or infilling of initial data.
 
@@ -880,7 +878,7 @@ Store operations also have implicit ordering guarantees that it “happens-after
    </td>
   </tr>
 </table>
-Resolve operations export the state of the subpass access contexts to the access context for the command buffer. For each subpass, the linear and idealized ResourceAccessRangeMap’s are traversed.  For each access state, the dstSubpass=VK_SUBPASS_EXTERNAL barrier is applied, and the result is merged with the command buffer access context. The resulting state is the resolve of all subpass access with their final barrier applied.  The resolve is performed after the store operation state update has completed.
+Resolve operations export the state of the subpass access contexts to the access context for the command buffer. For each access state, the dstSubpass=VK_SUBPASS_EXTERNAL barrier is applied, and the result is merged with the command buffer access context. The resulting state is the resolve of all subpass access with their final barrier applied.  The resolve is performed after the store operation state update has completed.
 
 
 ### Synchronization operations
@@ -1319,7 +1317,7 @@ Color attachment use is controlled by the fragment shader output declarations an
 
 **TODO/KNOWN LIMITATION: **First phase does not include component granularity access tracking.
 
-> Designer’s note.  Given the “inmost loop” nature of component read/write enable, it is likely the performance and memory use will be unacceptable unless the “Idealized” encoding changes the apparent memory organization of components to be at least just above the x, y, and z dimensions, s.t. the effective “run-length-compression” of the range maps is not lost. Storing access state byte-by-byte is likely not going to be acceptable.  Whether this encoding should be adaptive (only present for images with component level information) or globally present in the idealized encoding) is a design detail TBD. For broadest application this may mean that non-aliased linear tiling images should also be given an idealized encoding w.r.t. component granularity information. 
+> Designer’s note.  Given the “inmost loop” nature of component read/write enable, it is likely the performance and memory use will be unacceptable unless the opaque range encoding changes the apparent memory organization of components to be at least just above the x, y, and z dimensions, s.t. the effective “run-length-compression” of the range maps is not lost. Storing access state byte-by-byte is likely not going to be acceptable.  Whether this encoding should be adaptive (only present for images with component level information or globally present in the opaque range Synchronization Validation specific encoding) is a design detail TBD. For broadest application this may mean that non-aliased linear tiling images should also be given an an validation specific opaque encoding w.r.t. component granularity information. 
 
 
 ##### Depth/Stencil Attachments
