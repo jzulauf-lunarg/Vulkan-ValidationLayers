@@ -1449,11 +1449,15 @@ When memory can be interpreted a consistent way, hazard detection, and state upd
 
 This violates some assumptions of the non-aliased model in the following ways:
 
-1) that a single *idealized* mapping of tiled (opaque) image resources for a given binding range is sufficient
+1) that a single *opaque range* mapping of tiled image (or other implementation specific layout
 
-2) that only a single, most recent write and barrier state is sufficient to characterize the `ResourceAccessState`
+2) 
 
-3) that only a single, most recent read per stage is sufficient to characterize the `ResourceAccessState`
+3) ) resources for a given binding range is sufficient
+
+4) that only a single, most recent write and barrier state is sufficient to characterize the `ResourceAccessState`
+
+5) that only a single, most recent read per stage is sufficient to characterize the `ResourceAccessState`
 
 These all arise from the need to integrate the read, write, and synchronization operations over the entire bound range into a single, pessimistic `ResourceAccessState` reflecting the accesses and barriers defining the potential hazards.
 
