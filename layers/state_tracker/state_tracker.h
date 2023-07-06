@@ -1463,10 +1463,10 @@ class ValidationStateTracker : public ValidationObject {
                                         const VkShaderEXT* pShaders) override;
 
     template <typename ExtProp>
-    void GetPhysicalDeviceExtProperties(VkPhysicalDevice gpu, ExtEnabled enabled, ExtProp* ext_prop) {
+    void GetPhysicalDeviceExtProperties(VkPhysicalDevice gpu, ExtEnabled enabled, ExtProp* ext_prop, bool init = true) {
         assert(ext_prop);
         if (IsExtEnabled(enabled)) {
-            *ext_prop = LvlInitStruct<ExtProp>();
+            if (init) *ext_prop = LvlInitStruct<ExtProp>();
             if (api_version < VK_API_VERSION_1_1) {
                 auto prop2 = LvlInitStruct<VkPhysicalDeviceProperties2>(ext_prop);
                 DispatchGetPhysicalDeviceProperties2KHR(gpu, &prop2);
@@ -1600,10 +1600,13 @@ class ValidationStateTracker : public ValidationObject {
         VkPhysicalDeviceImageProcessingPropertiesQCOM image_processing_props;
         VkPhysicalDeviceDescriptorBufferPropertiesEXT descriptor_buffer_props;
         VkPhysicalDeviceDescriptorBufferDensityMapPropertiesEXT descriptor_buffer_density_props;
+        VkPhysicalDeviceHostImageCopyPropertiesEXT host_image_copy_properties;
     };
     DeviceExtensionProperties phys_dev_ext_props = {};
     std::vector<VkCooperativeMatrixPropertiesNV> cooperative_matrix_properties;
     std::vector<VkCooperativeMatrixPropertiesKHR> cooperative_matrix_properties_khr;
+    std::vector<VkImageLayout> host_image_copy_src_layouts;
+    std::vector<VkImageLayout> host_image_copy_dst_layouts;
 
     // Queue family extension properties -- storing queue family properties gathered from
     // VkQueueFamilyProperties2::pNext chain
