@@ -2919,7 +2919,7 @@ bool CoreChecks::ValidateHostCopyImageLayout(const VkDevice device, const VkImag
     if (!found) {
         LogObjectList objlist(device, image);
         skip |= LogError(objlist, vuid,
-                         "%s(): %s is %s which is not one of the layouts retuned in "
+                         "%s(): %s is %s which is not one of the layouts returned in "
                          "VkPhysicalDeviceHostImageCopyPropertiesEXT::%s",
                          func_name, field_name, string_VkImageLayout(image_layout), supported_name);
     }

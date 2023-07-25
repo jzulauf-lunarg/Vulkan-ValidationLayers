@@ -2290,6 +2290,8 @@ class CoreChecks : public ValidationStateTracker {
                                            VkSubresourceLayout& layout, bool is_ext) const;
     bool PreCallValidateTransitionImageLayoutEXT(VkDevice device, uint32_t transitionCount,
                                                  const VkHostImageLayoutTransitionInfoEXT* pTransitions) const override;
+    void PostCallRecordTransitionImageLayoutEXT(VkDevice device, uint32_t transitionCount,
+                                                const VkHostImageLayoutTransitionInfoEXT* pTransitions, VkResult result) override;
     bool PreCallValidateGetImageSubresourceLayout(VkDevice device, VkImage image, const VkImageSubresource* pSubresource,
                                                   VkSubresourceLayout* pLayout) const override;
     bool PreCallValidateGetImageSubresourceLayout2EXT(VkDevice device, VkImage image, const VkImageSubresource2EXT* pSubresource,
