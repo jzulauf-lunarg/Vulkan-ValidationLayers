@@ -3448,6 +3448,7 @@ TEST_F(NegativeCommand, CopyImageSampleCountMismatch) {
 TEST_F(NegativeCommand, CopyImageAspectMismatch) {
     TEST_DESCRIPTION("Image copies with aspect mask errors");
 
+    SetTargetApiVersion(VK_API_VERSION_1_1);
     AddRequiredExtensions(VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME);
     AddOptionalExtensions(VK_KHR_SAMPLER_YCBCR_CONVERSION_EXTENSION_NAME);
     ASSERT_NO_FATAL_FAILURE(InitFramework());
