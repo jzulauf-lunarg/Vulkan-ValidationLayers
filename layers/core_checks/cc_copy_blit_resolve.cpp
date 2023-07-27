@@ -2934,6 +2934,14 @@ bool CoreChecks::PreCallValidateCopyMemoryToImageEXT(VkDevice device,
     auto regionCount = pCopyMemoryToImageInfo->regionCount;
     const char func_name[] = "vkCopyMemoryToImageEXT";
 
+    for (uint32_t i = 0; i < regionCount; i++) {
+        const auto &region = pCopyMemoryToImageInfo->pRegions[i];
+
+        skip |= ValidateHostCopyCurrentLayout(device, pCopyMemoryToImageInfo->dstImageLayout, region.imageSubresource, i,
+                                              *image_state, func_name, "destination", "dstImageLayout",
+                                              "VUID-VkCopyImageToImageInfoEXT-srcImageLayout-09070");
+    }
+
     skip |= ValidateBufferMemoryImageCopyData(device, regionCount, pCopyMemoryToImageInfo->pRegions, *image_state, func_name,
                                               CMD_NONE, false, true);
     skip |= ValidateMemoryImageCopyCommon(device, pCopyMemoryToImageInfo, false);

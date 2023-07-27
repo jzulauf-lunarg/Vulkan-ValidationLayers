@@ -6341,3 +6341,52 @@ TEST_F(NegativeImage, GetPhysicalDeviceImageFormatProperties) {
     image.Init(128, 128, 1, VK_FORMAT_E5B9G9R9_UFLOAT_PACK32, VK_IMAGE_USAGE_STORAGE_BIT, VK_IMAGE_TILING_OPTIMAL, 0);
     m_errorMonitor->VerifyFound();
 }
+
+TEST_F(NegativeImage, HostImageCopy) {
+    TEST_DESCRIPTION("Use VK_EXT_host_image_copy");
+    SetTargetApiVersion(VK_API_VERSION_1_3);
+    AddRequiredExtensions(VK_EXT_HOST_IMAGE_COPY_EXTENSION_NAME);
+    ASSERT_NO_FATAL_FAILURE(InitFramework());
+    if (!AreRequiredExtensionsEnabled()) {
+        GTEST_SKIP() << RequiredExtensionsNotSupported() << " not supported";
+    }
+    
+    auto host_copy_features = LvlInitStruct<VkPhysicalDeviceHostImageCopyFeaturesEXT>();
+    GetPhysicalDeviceFeatures2(host_copy_features);
+    if (!host_copy_features.hostImageCopy) {
+        GTEST_SKIP() << "Test requires (unsupported) multiDraw";
+    }
+
+    ASSERT_NO_FATAL_FAILURE(InitState(nullptr, &host_copy_features));
+    uint32_t width = 128;
+    uint32_t height = 128;
+    auto image_ci = VkImageObj::ImageCreateInfo2D(width, height, 1, 1, VK_FORMAT_R8G8B8A8_UNORM,
+                                                  VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+                                                  VK_IMAGE_TILING_OPTIMAL);
+    VkImageObj image(m_device);
+    image.Init(image_ci);
+    image.SetLayout(VK_IMAGE_ASPECT_COLOR_BIT, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+
+    //VkImageObj image(m_device);
+    //image.InitNoLayout(width, height, 1, VK_FORMAT_R8G8B8A8_UNORM, VK_IMAGE_USAGE_HOST_TRANSFER_BIT_EXT, VK_IMAGE_TILING_OPTIMAL,
+    //                   VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    std::vector<uint8_t> pixels(width * height * 4);
+
+    auto region = LvlInitStruct<VkMemoryToImageCopyEXT>();
+    region.pHostPointer = pixels.data();
+    region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    region.imageSubresource.layerCount = 1;
+    region.imageExtent.width = width;
+    region.imageExtent.height = height;
+    region.imageExtent.depth = 1;
+    
+    auto copy = LvlInitStruct<VkCopyMemoryToImageInfoEXT>();
+    copy.flags = 0;
+    copy.dstImage = image;
+    copy.dstImageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    copy.regionCount = 1;
+    copy.pRegions = &region;
+
+    VkResult result = vk::CopyMemoryToImageEXT(*m_device, &copy);
+
+}
