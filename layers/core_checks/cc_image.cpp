@@ -2297,7 +2297,7 @@ bool CoreChecks::PreCallValidateTransitionImageLayoutEXT(VkDevice device, uint32
     const char *func_name = "vkTransitionImageLayoutEXT()";
 
     for (uint32_t i = 0; i < transitionCount; ++i) {
-        auto transition = pTransitions[i];
+        auto &transition = pTransitions[i];
         auto image_state = Get<IMAGE_STATE>(transition.image);
         auto image_format = image_state->createInfo.format;
         auto aspect_mask = transition.subresourceRange.aspectMask;
@@ -2395,6 +2395,10 @@ bool CoreChecks::PreCallValidateTransitionImageLayoutEXT(VkDevice device, uint32
         skip |= ValidateHostCopyImageLayout(device, transition.image, props->copyDstLayoutCount, props->pCopyDstLayouts,
                                             transition.newLayout, func_name, "newLayout", "pCopyDstLayouts",
                                             "VUID-VkHostImageLayoutTransitionInfoEXT-newLayout-09057");
+        if (transition.oldLayout != VK_IMAGE_LAYOUT_UNDEFINED) {
+            skip |= ValidateHostCopyCurrentLayout(device, transition.oldLayout, transition.subresourceRange, i, *image_state,
+                                                  func_name, "transition", "oldLayout", "WIP: Should there be a VUID for this?");
+        }
     }
     return skip;
 };
@@ -2402,11 +2406,15 @@ bool CoreChecks::PreCallValidateTransitionImageLayoutEXT(VkDevice device, uint32
 void CoreChecks::PostCallRecordTransitionImageLayoutEXT(VkDevice device, uint32_t transitionCount,
                                                         const VkHostImageLayoutTransitionInfoEXT *pTransitions, VkResult result) {
     ValidationStateTracker::PostCallRecordTransitionImageLayoutEXT(device, transitionCount, pTransitions, result);
-    //for (uint32_t i = 0; i < transitionCount; ++i) {
-        // auto transition = pTransitions[i];
-        // auto image_state = GetWrite<IMAGE_STATE>(transition.image);
-        // Todo Update image's layout_range_map in transition.subresourceRange
-    //}
+
+    if (VK_SUCCESS != result) return;
+
+    for (uint32_t i = 0; i < transitionCount; ++i) {
+        auto &transition = pTransitions[i];
+        auto image_state = Get<IMAGE_STATE>(transition.image);
+        if (!image_state) continue;
+        image_state->SetImageLayout(transition.subresourceRange, transition.newLayout);
+    }
 }
 
 // Validates the image is allowed to be protected
