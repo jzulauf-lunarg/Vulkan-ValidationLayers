@@ -558,6 +558,7 @@ class ResourceAccessState : public SyncStageAccess {
 
     void OffsetTag(ResourceUsageTag offset);
     ResourceAccessState();
+    ResourceAccessState(const ResourceAccessState &) = default;
 
     bool HasPendingState() const {
         return (0 != pending_layout_transition) || pending_write_barriers.any() || (0 != pending_write_dep_chain);
