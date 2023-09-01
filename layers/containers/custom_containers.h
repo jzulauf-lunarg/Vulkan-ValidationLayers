@@ -364,11 +364,11 @@ class small_vector {
 
   protected:
     inline const_pointer GetWorkingStore() const {
-        const BackingStore *store = large_store_ ? large_store_.get() : small_store_;
+        const BackingStore *store = capacity_ > kSmallCapacity ? large_store_.get() : small_store_;
         return &store->object;
     }
     inline pointer GetWorkingStore() {
-        BackingStore *store = large_store_ ? large_store_.get() : small_store_;
+        BackingStore *store = capacity_ > kSmallCapacity ? large_store_.get() : small_store_;
         return &store->object;
     }
 
@@ -386,10 +386,10 @@ class small_vector {
         uint8_t data[sizeof(value_type)];
         value_type object;
     };
+    std::unique_ptr<BackingStore[]> large_store_;
+    BackingStore small_store_[N];
     size_type size_;
     size_type capacity_;
-    BackingStore small_store_[N];
-    std::unique_ptr<BackingStore[]> large_store_;
 
 #ifdef NDEBUG
     void DebugUpdateWorkingStore() {}
