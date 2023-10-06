@@ -127,6 +127,8 @@ void CMD_BUFFER_STATE::ResetCBState() {
     resumesRenderPassInstance = false;
     state = CbState::New;
     command_count = 0;
+    last_command = Func::Empty;
+    last_command_repeat = 0;
     submitCount = 0;
     image_layout_change_count = 1;  // Start at 1. 0 is insert value for validation cache versions, s.t. new == dirty
     dynamic_state_status.cb.reset();
@@ -1339,7 +1341,15 @@ void CMD_BUFFER_STATE::SetImageViewLayout(const IMAGE_VIEW_STATE &view_state, Vk
     }
 }
 
-void CMD_BUFFER_STATE::RecordCmd(Func command) { command_count++; }
+void CMD_BUFFER_STATE::RecordCmd(Func command) {
+    command_count++;
+    if (command == last_command) {
+        last_command_repeat++;
+    } else {
+        last_command = command;
+        last_command_repeat = 0;
+    }
+}
 
 void CMD_BUFFER_STATE::RecordStateCmd(Func command, CBDynamicState state) {
     CBDynamicFlags state_bits;

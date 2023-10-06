@@ -1275,6 +1275,7 @@ class AccessContext {
     AccessContext() { Reset(); }
     AccessContext(const AccessContext &copy_from) = default;
     void Trim();
+    void TrimAndClearFirstAccess();
     void AddReferencedTags(ResourceUsageTagSet &referenced) const;
 
     ResourceAccessRangeMap &GetAccessStateMap() { return access_state_map_; }
@@ -1333,6 +1334,10 @@ class AccessContext {
     HazardResult DetectHazard(Detector &detector, const ResourceAccessRange &range, DetectOptions options) const;
     template <typename Detector>
     HazardResult DetectAsyncHazard(const Detector &detector, const ResourceAccessRange &range, ResourceUsageTag async_tag) const;
+
+    template <typename NormalizeOp>
+    void Trim(NormalizeOp &&normalize);
+
     template <typename Detector>
     HazardResult DetectPreviousHazard(Detector &detector, const ResourceAccessRange &range) const;
 
@@ -1617,6 +1622,7 @@ class CommandBufferAccessContext : public CommandExecutionContext {
     void RecordDrawVertex(const std::optional<uint32_t> &vertexCount, uint32_t firstVertex, ResourceUsageTag tag);
     bool ValidateDrawVertexIndex(const std::optional<uint32_t> &indexCount, uint32_t firstIndex, const Location &loc) const;
     void RecordDrawVertexIndex(const std::optional<uint32_t> &indexCount, uint32_t firstIndex, ResourceUsageTag tag);
+    bool IsRedundantAttachmentCheck(vvl::Func func) const;
     bool ValidateDrawSubpassAttachment(const Location &loc) const;
     void RecordDrawSubpassAttachment(ResourceUsageTag tag);
     ResourceUsageTag RecordNextSubpass(vvl::Func command);

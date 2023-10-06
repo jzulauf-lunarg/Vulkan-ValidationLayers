@@ -178,7 +178,9 @@ class CMD_BUFFER_STATE : public REFCOUNTED_NODE {
     bool has_build_as_cmd;
 
     CbState state;           // Track cmd buffer update state
+    Func last_command;
     uint64_t command_count;  // Number of commands recorded. Currently only used with VK_KHR_performance_query
+    uint64_t last_command_repeat;
     uint64_t submitCount;    // Number of times CB has been submitted
     typedef uint64_t ImageLayoutUpdateCount;
     ImageLayoutUpdateCount image_layout_change_count;  // The sequence number for changes to image layout (for cached validation)

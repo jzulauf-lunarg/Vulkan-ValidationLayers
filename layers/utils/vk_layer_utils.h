@@ -789,4 +789,45 @@ const typename T::value_type *DataOrNull(const T &container) {
 template <typename>
 inline constexpr bool dependent_false_v = false;
 
+struct DebugCounter {
+    // List these first so they are prominent in the IDE "collapsed view"
+    volatile size_t count;
+    double ratio;
+    const char *const label;
+    const size_t threshold;
+    const DebugCounter *const ref_counter;
+    size_t next_limit;
+    const char *Inc() { return Add(1); }
+    const char *Add(size_t add) {
+        const char *ret = nullptr;
+        size_t new_count = count + add;
+
+        // When breaking on limit, it's nice to have the ratio up to date
+        if (ref_counter && (0 != ref_counter->count)) ratio = double(new_count) / double(ref_counter->count);
+
+        // We return the label at limit crossings to allow easy conditional breakpoints
+        if (new_count >= next_limit) {
+            // Not a bad place to break
+            ret = label;
+            next_limit += threshold;
+        }
+
+        count = new_count;
+        return ret;
+    }
+    void Reset() {
+        count = 0;
+        next_limit = threshold;
+        ratio = 0.;
+    }
+
+    DebugCounter(const char *lbl, size_t thresh, const DebugCounter *ref = nullptr)
+        : count(0), ratio(0.), label(lbl), threshold(thresh), ref_counter(ref), next_limit(thresh) {}
+};
+
 }  // namespace vvl
+
+inline std::ostream &operator<<(std::ostream &os, const vvl::DebugCounter &counter) {
+    os << "label: " << counter.label << ", count: " << counter.count << ", ratio: " << counter.ratio;
+    return os;
+}

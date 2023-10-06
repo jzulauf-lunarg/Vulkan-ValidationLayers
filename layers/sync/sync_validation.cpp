@@ -23,6 +23,16 @@
 #include "sync/sync_validation.h"
 #include "sync/sync_utils.h"
 
+#include <iostream>
+static vvl::DebugCounter zzz_endsubpass("end_subpass", 10000);
+static vvl::DebugCounter zzz_validate_attachment("validate_attachment", 100000000, &zzz_endsubpass);
+void zzz_count_endsubpass() {
+    if (zzz_endsubpass.Inc()) {
+        std::cout << zzz_endsubpass << std::endl;
+        std::cout << zzz_validate_attachment << std::endl;
+    }
+}
+
 // Utilities to DRY up Get... calls
 template <typename Map, typename Key = typename Map::key_type, typename RetVal = std::optional<typename Map::mapped_type>>
 RetVal GetMappedOptional(const Map &map, const Key &key) {
@@ -800,11 +810,23 @@ AccessContext::AccessContext(uint32_t subpass, VkQueueFlags queue_flags,
     }
 }
 
+template <typename NormalizeOp>
+void AccessContext::Trim(NormalizeOp &&normalize) {
+    ForAll(std::forward<NormalizeOp>(normalize));
+    sparse_container::consolidate(access_state_map_);
+}
+
 void AccessContext::Trim() {
     auto normalize = [](ResourceAccessRangeMap::value_type &access) { access.second.Normalize(); };
-    ForAll(normalize);
-    // Consolidate map after normalization, combines directly adjacent ranges with common values.
-    sparse_container::consolidate(access_state_map_);
+    Trim(normalize);
+}
+
+void AccessContext::TrimAndClearFirstAccess() {
+    auto normalize = [](ResourceAccessRangeMap::value_type &access) {
+        access.second.Normalize();
+        access.second.ClearFirstUse();
+    };
+    Trim(normalize);
 }
 
 void AccessContext::AddReferencedTags(ResourceUsageTagSet &used) const {
@@ -2269,11 +2291,32 @@ void CommandBufferAccessContext::RecordDrawVertexIndex(const std::optional<uint3
     //       We will detect more accurate range in the future.
     RecordDrawVertex(std::optional<uint32_t>(), 0, tag);
 }
+bool CommandBufferAccessContext::IsRedundantAttachmentCheck(vvl::Func func) const {
+    // If we've done two draw calls in a row before this one, the attachment check result isn't going to change
+    // the first call checks against whatever was before, the second call checks the effect of one draw on the other
+    // We could be smarter and check that *any* type of draw (not just the last extact type) has happened twice before
+    // but that's likely more bookeeping than it's worth
+    bool redundant = cb_state_ && (cb_state_->last_command == func) && (cb_state_->last_command_repeat > 1);
+    return redundant;
+}
 
 bool CommandBufferAccessContext::ValidateDrawSubpassAttachment(const Location &loc) const {
+    static vvl::DebugCounter zzz_draw("draw", 100000);
+    static vvl::DebugCounter zzz_skip("skipped", 100000000, &zzz_draw);
+
     bool skip = false;
     if (!current_renderpass_context_) return skip;
-    skip |= current_renderpass_context_->ValidateDrawSubpassAttachment(GetExecutionContext(), *cb_state_, loc.function);
+
+    const char *zzz_report = zzz_draw.Inc();
+
+    if (!IsRedundantAttachmentCheck(loc.function)) {
+        skip |= current_renderpass_context_->ValidateDrawSubpassAttachment(GetExecutionContext(), *cb_state_, loc.function);
+    } else {
+        zzz_skip.Inc();
+    }
+    if (zzz_report) {
+        std::cout << zzz_skip << std::endl;
+    }
     return skip;
 }
 
@@ -2498,6 +2541,7 @@ HazardResult AccessContext::DetectFirstUseHazard(QueueId queue_id, const Resourc
 
 bool RenderPassAccessContext::ValidateDrawSubpassAttachment(const CommandExecutionContext &exec_context,
                                                             const CMD_BUFFER_STATE &cmd_buffer, vvl::Func command) const {
+    zzz_validate_attachment.Inc();
     bool skip = false;
     const auto &sync_state = exec_context.GetSyncState();
     const auto lv_bind_point = ConvertToLvlBindPoint(VK_PIPELINE_BIND_POINT_GRAPHICS);
@@ -3019,6 +3063,48 @@ void RenderPassAccessContext::RecordNextSubpass(const ResourceUsageTag store_tag
     RecordLoadOperations(load_tag);
 }
 
+#if 0
+#include <algorithm>
+struct DebugCounter {
+    // List these first so they are prominent in the IDE "collapsed view"
+    volatile size_t count;
+    double ratio;
+    const char* const label;
+    const size_t threshold;
+    const DebugCounter const* ref_counter;
+    size_t next_limit;
+    const char* update(size_t add) {
+        const char* ret = nullptr;
+        size_t new_count = count + add;
+
+        // When breaking on limit, it's nice to have the ratio up to date
+        if (ref_counter && (0 != ref_counter->count)) ratio = double(new_count) / double(ref_counter->count);
+
+        // We return the label at limit crossings to allow easy conditional breakpoints
+        if (new_count >= next_limit) {
+            ret = label;
+            next_limit += threshold;
+        }
+
+        count = new_count;
+        return ret;
+    }
+    DebugCounter(const char* lbl, size_t thresh, const DebugCounter *ref = nullptr) 
+        : count(0),
+          ratio(0.),
+          label(lbl),
+          threshold(thresh),
+          ref_counter(ref),
+          next_limit(thresh) {}
+
+};
+
+std::ostream& operator<<(std::ostream& os, const DebugCounter& counter) {
+    os << "label: " << counter.label << ", count: " << counter.count << ", ratio: " << counter.ratio;
+    return os;
+}
+#endif
+
 void RenderPassAccessContext::RecordEndRenderPass(AccessContext *external_context, const ResourceUsageTag store_tag,
                                                   const ResourceUsageTag barrier_tag) {
     // Add the resolve and store accesses
@@ -3044,6 +3130,7 @@ void RenderPassAccessContext::RecordEndRenderPass(AccessContext *external_contex
         }
         external_context->ApplyUpdateAction(view_gen, AttachmentViewGen::Gen::kViewSubresource, barrier_action);
     }
+    zzz_count_endsubpass();
 }
 
 SyncExecScope SyncExecScope::MakeSrc(VkQueueFlags queue_flags, VkPipelineStageFlags2KHR mask_param,
@@ -3896,17 +3983,7 @@ bool operator<(const ResourceAccessState::ReadState &lhs, const ResourceAccessSt
 }
 
 void ResourceAccessState::Normalize() {
-    if (!last_reads.size()) {
-        ClearRead();
-    } else {
-        // Sort the reads in stage order for consistent comparisons
-        std::sort(last_reads.begin(), last_reads.end());
-        for (auto &read_access : last_reads) {
-            read_access.Normalize();
-        }
-    }
-
-    ClearPending();
+    std::sort(last_reads.begin(), last_reads.end());
     ClearFirstUse();
 }
 
@@ -4852,6 +4929,7 @@ void SyncValidator::RecordCmdNextSubpass(VkCommandBuffer commandBuffer, const Vk
     auto *cb_context = &cb_state->access_context;
 
     cb_context->RecordSyncOp<SyncOpNextSubpass>(command, *this, pSubpassBeginInfo, pSubpassEndInfo);
+    zzz_count_endsubpass();
 }
 
 void SyncValidator::PostCallRecordCmdNextSubpass(VkCommandBuffer commandBuffer, VkSubpassContents contents,
@@ -7357,7 +7435,7 @@ void SyncOpSetEvent::ReplayRecord(CommandExecutionContext &exec_context, Resourc
     // Note: merged_context is a copy of the access_context, combined with the recorded context
     auto merged_context = std::make_shared<AccessContext>(*access_context);
     merged_context->ResolveFromContext(QueueTagOffsetBarrierAction(queue_id, exec_tag), *recorded_context_);
-    merged_context->Trim();  // Ensure the copy is minimal and normalized
+    merged_context->TrimAndClearFirstAccess();  // Ensure the copy is minimal and normalized
     DoRecord(queue_id, exec_tag, merged_context, events_context);
 }
 
@@ -8069,7 +8147,7 @@ QueueBatchContext::QueueBatchContext(const SyncValidator &sync_state)
 
 void QueueBatchContext::Trim() {
     // Clean up unneeded access context contents and log information
-    access_context_.Trim();
+    access_context_.TrimAndClearFirstAccess();
 
     ResourceUsageTagSet used_tags;
     access_context_.AddReferencedTags(used_tags);
