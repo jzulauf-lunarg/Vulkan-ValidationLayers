@@ -873,20 +873,60 @@ HazardResult AccessContext::DetectHazardRange(Detector &detector, const Resource
     return DetectHazardGeneratedRanges(detector, range_gen, options);
 }
 
+// Action is const w.r.t. map
+// Action is allowed (assumed) to modify pos
+// Action must not advance pos for ranges strictly < pos->first
+// Action must handle range strictly less than pos->first correctly
+// Action must handle pos == end correctly
+// Action is assumed to only require invocation once per map entry
+// Note: If Action invocations are heavyweight and inter-entry (gap) calls are not needed
+//       add a template or function parameter to skip them. TBD.
 template <typename RangeMap, typename RangeGen, typename Action>
 bool ConstForAnyRangeGen(const RangeMap &map, RangeGen &range_gen, Action &action) {
+    using RangeType = typename RangeGen::RangeType;
+    using IndexType = typename RangeType::index_type;
     auto pos = map.lower_bound(*range_gen);
     const auto end = map.end();
+    IndexType skip_limit = 0;
     for (; range_gen->non_empty() && pos != end; ++range_gen) {
-        const typename RangeGen::RangeType &range = *range_gen;
-        if (pos->first.strictly_less(range)) {
-            pos = map.lower_bound(range);
+        RangeType range = *range_gen;
+        // See if a prev pos has covered this range
+        if (range.end <= skip_limit) {
+            // Since the map is const, we needn't call action on the same pos again
+            continue;
         }
-        // Action is allowed to alter pos
+
+        //  If the current range was *partially* covered be a previous pos, trim, such that Action is only
+        //  called once for a given range (and pos)
+        if (range.begin < skip_limit) {
+            range.begin = skip_limit;
+        }
+
+        // Now advance pos as needed to match range
+        bool zzz_incd = false;
+        if (pos->first.strictly_less(range)) {
+            zzz_incd = true;
+            ++pos;
+            if (pos->first.strictly_less(range)) {
+                pos = map.lower_bound(range);
+                if (pos == end) break;
+            }
+        }
+        assert(pos == map.lower_bound(range));
+
+        // If the range intersects pos->first, consider Action performed for that map entry, and
+        // make sure not to call Action for this pos for any subsequent ranges
+        skip_limit = range.end > pos->first.begin ? pos->first.end : 0U;
+
+        // Action is allowed to alter pos but shouldn't do so if range is strictly < pos->first
         if (action(range, end, pos)) return true;
-        if (pos == end) return false;
-        ++pos;
     }
+
+    // Action needs to handle the "at end " condition (and can be useful for recursive actions)
+    for (; range_gen->non_empty(); ++range_gen) {
+        if (action(*range_gen, end, pos)) return true;
+    }
+
     return false;
 }
 
