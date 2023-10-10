@@ -797,6 +797,8 @@ struct DebugCounter {
     const size_t threshold;
     const DebugCounter *const ref_counter;
     size_t next_limit;
+    bool at_threshold;
+
     const char *Inc() { return Add(1); }
     const char *Add(size_t add) {
         const char *ret = nullptr;
@@ -807,14 +809,21 @@ struct DebugCounter {
 
         // We return the label at limit crossings to allow easy conditional breakpoints
         if (new_count >= next_limit) {
+            at_threshold = true;
             // Not a bad place to break
             ret = label;
             next_limit += threshold;
+            at_threshold = true;  // Only until next Add
+        } else {
+            at_threshold = false;
         }
 
         count = new_count;
         return ret;
     }
+    const char *IncIf(bool condition) { return Add(condition ? 1U : 0U); }
+    const char *AddIf(size_t add, bool condition) { return Add(condition ? add : 0U); }
+
     void Reset() {
         count = 0;
         next_limit = threshold;

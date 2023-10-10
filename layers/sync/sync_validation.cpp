@@ -429,6 +429,7 @@ static ResourceAccessRange MakeRange(const BufferBinding &binding, uint32_t firs
 template <typename KeyType>
 class SingleRangeGenerator {
   public:
+    using RangeType = KeyType;
     SingleRangeGenerator(const KeyType &range) : current_(range) {}
     const KeyType &operator*() const { return current_; }
     const KeyType *operator->() const { return &current_; }
@@ -866,34 +867,65 @@ void AccessContext::EraseIf(Predicate &&pred) {
     vvl::EraseIf(access_state_map_, pred);
 }
 
-template <typename Detector, typename RangeGen>
-HazardResult AccessContext::DetectHazard(Detector &detector, RangeGen &range_gen, DetectOptions options) const {
-    for (; range_gen->non_empty(); ++range_gen) {
-        HazardResult hazard = DetectHazard(detector, *range_gen, options);
-        if (hazard.IsHazard()) return hazard;
+template <typename Detector>
+HazardResult AccessContext::DetectHazardRange(Detector &detector, const ResourceAccessRange &range, DetectOptions options) const {
+    SingleRangeGenerator range_gen(range);
+    return DetectHazardGeneratedRanges(detector, range_gen, options);
+}
+
+template <typename RangeMap, typename RangeGen, typename Action>
+bool ConstForAnyRangeGen(const RangeMap &map, RangeGen &range_gen, Action &action) {
+    auto pos = map.lower_bound(*range_gen);
+    const auto end = map.end();
+    for (; range_gen->non_empty() && pos != end; ++range_gen) {
+        const typename RangeGen::RangeType &range = *range_gen;
+        if (pos->first.strictly_less(range)) {
+            pos = map.lower_bound(range);
+        }
+        // Action is allowed to alter pos
+        if (action(range, end, pos)) return true;
+        if (pos == end) return false;
+        ++pos;
     }
-    return HazardResult();
+    return false;
 }
 
 // A recursive range walker for hazard detection, first for the current context and the (DetectHazardRecur) to walk
 // the DAG of the contexts (for example subpasses)
-template <typename Detector>
-HazardResult AccessContext::DetectHazard(Detector &detector, const ResourceAccessRange &range, DetectOptions options) const {
+template <typename Detector, typename RangeGen>
+HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, RangeGen &range_gen, DetectOptions options) const {
     HazardResult hazard;
 
+    // Do this before range_gen is incremented s.t. the copies used will be correct
     if (static_cast<uint32_t>(options) & DetectOptions::kDetectAsync) {
         // Async checks don't require recursive lookups, as the async lists are exhaustive for the top-level context
         // so we'll check these first
         for (const auto &async_ref : async_) {
-            hazard = async_ref.Context().DetectAsyncHazard(detector, range, async_ref.StartTag());
+            hazard = async_ref.Context().DetectAsyncHazard(detector, range_gen, async_ref.StartTag());
             if (hazard.IsHazard()) return hazard;
         }
     }
 
     const bool detect_prev = (static_cast<uint32_t>(options) & DetectOptions::kDetectPrevious) != 0;
 
-    const auto the_end = access_state_map_.cend();  // End is not invalidated
-    auto pos = access_state_map_.lower_bound(range);
+    using RangeType = typename RangeGen::RangeType;
+    using ConstIterator = ResourceAccessRangeMap::const_iterator;
+    auto do_detect_hazard_range = [this, &detector, &hazard, detect_prev](const RangeType &range, const ConstIterator &end,
+                                                                          ConstIterator &pos) {
+        hazard = DetectHazardOneRange(detector, detect_prev, pos, end, range);
+        return hazard.IsHazard();
+    };
+
+    ConstForAnyRangeGen(access_state_map_, range_gen, do_detect_hazard_range);
+
+    return hazard;
+}
+
+template <typename Detector>
+HazardResult AccessContext::DetectHazardOneRange(Detector &detector, bool detect_prev, ResourceAccessRangeMap::const_iterator &pos,
+                                                 const ResourceAccessRangeMap::const_iterator &the_end,
+                                                 const ResourceAccessRange &range) const {
+    HazardResult hazard;
     ResourceAccessRange gap = {range.begin, range.begin};
 
     while (pos != the_end && pos->first.begin < range.end) {
@@ -928,18 +960,26 @@ HazardResult AccessContext::DetectHazard(Detector &detector, const ResourceAcces
 }
 
 // A non recursive range walker for the asynchronous contexts (those we have no barriers with)
-template <typename Detector>
-HazardResult AccessContext::DetectAsyncHazard(const Detector &detector, const ResourceAccessRange &range,
+template <typename Detector, typename RangeGen>
+HazardResult AccessContext::DetectAsyncHazard(const Detector &detector, const RangeGen &const_range_gen,
                                               ResourceUsageTag async_tag) const {
-    auto pos = access_state_map_.lower_bound(range);
-    const auto the_end = access_state_map_.end();
+    using RangeType = typename RangeGen::RangeType;
+    using ConstIterator = ResourceAccessRangeMap::const_iterator;
+    RangeGen range_gen(const_range_gen);
 
     HazardResult hazard;
-    while (pos != the_end && pos->first.begin < range.end) {
-        hazard = detector.DetectAsync(pos, async_tag);
-        if (hazard.IsHazard()) break;
-        ++pos;
-    }
+
+    auto do_async_hazard_check = [this, &detector, async_tag, &hazard](const RangeType &range, const ConstIterator &end,
+                                                                       ConstIterator &pos) {
+        while (pos != end && pos->first.begin < range.end) {
+            hazard = detector.DetectAsync(pos, async_tag);
+            if (hazard.IsHazard()) return true;
+            ++pos;
+        }
+        return false;
+    };
+
+    ConstForAnyRangeGen(access_state_map_, range_gen, do_async_hazard_check);
 
     return hazard;
 }
@@ -1374,7 +1414,7 @@ HazardResult AccessContext::DetectHazard(const BUFFER_STATE &buffer, SyncStageAc
     if (!SimpleBinding(buffer)) return HazardResult();
     const auto base_address = ResourceBaseAddress(buffer);
     HazardDetector detector(usage_index);
-    return DetectHazard(detector, (range + base_address), DetectOptions::kDetectAll);
+    return DetectHazardRange(detector, (range + base_address), DetectOptions::kDetectAll);
 }
 
 template <typename Detector>
@@ -1384,7 +1424,7 @@ HazardResult AccessContext::DetectHazard(Detector &detector, const AttachmentVie
     if (!attachment_gen) return HazardResult();
 
     subresource_adapter::ImageRangeGenerator range_gen(*attachment_gen);
-    return DetectHazard(detector, range_gen, options);
+    return DetectHazardGeneratedRanges(detector, range_gen, options);
 }
 
 template <typename Detector>
@@ -1393,7 +1433,7 @@ HazardResult AccessContext::DetectHazard(Detector &detector, const ImageState &i
                                          const VkExtent3D &extent, bool is_depth_sliced, DetectOptions options) const {
     // range_gen is non-temporary to avoid additional copy
     ImageRangeGen range_gen = image.MakeImageRangeGen(subresource_range, offset, extent, is_depth_sliced);
-    return DetectHazard(detector, range_gen, options);
+    return DetectHazardGeneratedRanges(detector, range_gen, options);
 }
 
 template <typename Detector>
@@ -1402,7 +1442,7 @@ HazardResult AccessContext::DetectHazard(Detector &detector, const ImageState &i
                                          DetectOptions options) const {
     // range_gen is non-temporary to avoid additional copy
     ImageRangeGen range_gen = image.MakeImageRangeGen(subresource_range, is_depth_sliced);
-    return DetectHazard(detector, range_gen, options);
+    return DetectHazardGeneratedRanges(detector, range_gen, options);
 }
 
 HazardResult AccessContext::DetectHazard(const ImageState &image, SyncStageAccessIndex current_usage,
@@ -1423,7 +1463,7 @@ HazardResult AccessContext::DetectHazard(const ImageState &image, SyncStageAcces
 HazardResult AccessContext::DetectHazard(const ImageViewState &image_view, SyncStageAccessIndex current_usage) const {
     // Get is const, but callee will copy
     HazardDetector detector(current_usage);
-    return DetectHazard(detector, image_view.GetFullViewImageRangeGen(), DetectOptions::kDetectAll);
+    return DetectHazardGeneratedRanges(detector, image_view.GetFullViewImageRangeGen(), DetectOptions::kDetectAll);
 }
 
 HazardResult AccessContext::DetectHazard(const ImageViewState &image_view, SyncStageAccessIndex current_usage,
@@ -1431,7 +1471,7 @@ HazardResult AccessContext::DetectHazard(const ImageViewState &image_view, SyncS
     // range_gen is non-temporary to avoid an additional copy
     ImageRangeGen range_gen(image_view.MakeImageRangeGen(offset, extent));
     HazardDetectorWithOrdering detector(current_usage, ordering_rule);
-    return DetectHazard(detector, range_gen, DetectOptions::kDetectAll);
+    return DetectHazardGeneratedRanges(detector, range_gen, DetectOptions::kDetectAll);
 }
 
 HazardResult AccessContext::DetectHazard(const AttachmentViewGen &view_gen, AttachmentViewGen::Gen gen_type,
@@ -2532,7 +2572,7 @@ HazardResult AccessContext::DetectFirstUseHazard(QueueId queue_id, const Resourc
         // Cull any entries not in the current tag range
         if (!recorded_access.second.FirstAccessInTagRange(tag_range)) continue;
         HazardDetectFirstUse detector(recorded_access.second, queue_id, tag_range);
-        hazard = access_context.DetectHazard(detector, recorded_access.first, DetectOptions::kDetectAll);
+        hazard = access_context.DetectHazardRange(detector, recorded_access.first, DetectOptions::kDetectAll);
         if (hazard.IsHazard()) break;
     }
 
@@ -8426,7 +8466,8 @@ bool QueueBatchContext::DoQueuePresentValidate(const Location &loc, const Presen
         const PresentedImage &presented = presented_images[index];
 
         // Need a copy that can be used as the pseudo-iterator...
-        HazardResult hazard = access_context_.DetectHazard(detector, presented.range_gen, AccessContext::DetectOptions::kDetectAll);
+        HazardResult hazard =
+            access_context_.DetectHazardGeneratedRanges(detector, presented.range_gen, AccessContext::DetectOptions::kDetectAll);
         if (hazard.IsHazard()) {
             const auto queue_handle = queue_state_->Handle();
             const auto swap_handle = BASE_NODE::Handle(presented.swapchain_state.lock());
