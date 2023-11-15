@@ -1715,9 +1715,19 @@ void infill_update_range(RangeMap &map, const typename RangeMap::key_type &range
 
 template <typename RangeMap, typename RangeGen, typename InfillUpdateOps>
 void infill_update_rangegen(RangeMap &map, RangeGen &range_gen, const InfillUpdateOps &ops) {
+    using IndexType = typename RangeMap::index_type;
+    if (!range_gen->non_empty()) return;
+
     auto pos = map.lower_bound(*range_gen);
+    IndexType prev_begin = range_gen->begin;
     for (; range_gen->non_empty(); ++range_gen) {
+        if (range_gen->begin < prev_begin) {
+            // Handle a non-monotonic range generator
+            // TONY WIP WIP WIP Set break point here to see if this is happening
+            pos = map.lower_bound(*range_gen);
+        }
         pos = infill_update_range(map, pos, *range_gen, ops);
+        prev_begin = range_gen->begin;
     }
 }
 
