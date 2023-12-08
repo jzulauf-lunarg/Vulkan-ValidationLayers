@@ -273,7 +273,7 @@ template <typename Predicate>
 void QueueBatchContext::ApplyPredicatedWait(Predicate& predicate) {
     access_context_.EraseIf([&predicate](ResourceAccessRangeMap::value_type& access) {
         // Apply..Wait returns true if the waited access is empty...
-        return access.second.ApplyPredicatedWait<Predicate>(predicate);
+        return access.second->GetState().ApplyPredicatedWait<Predicate>(predicate);
     });
 }
 

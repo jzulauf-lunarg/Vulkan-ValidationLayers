@@ -503,9 +503,6 @@ class ResourceAccessState : public SyncStageAccess {
 
     static OrderingBarriers kOrderingRules;
 };
-using ResourceAccessStateFunction = std::function<void(ResourceAccessState *)>;
-using ResourceAccessRangeMap = sparse_container::range_map<ResourceAddress, ResourceAccessState>;
-using ResourceRangeMergeIterator = sparse_container::parallel_iterator<ResourceAccessRangeMap, const ResourceAccessRangeMap>;
 
 // Apply the memory barrier without updating the existing barriers.  The execution barrier
 // changes the "chaining" state, but to keep barriers independent, we defer this until all barriers

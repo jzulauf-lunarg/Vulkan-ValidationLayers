@@ -26,9 +26,9 @@ class HazardDetector {
     const SyncStageAccessInfoType &usage_info_;
 
   public:
-    HazardResult Detect(const ResourceAccessState &state) const { return state.DetectHazard(usage_info_); }
-    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
-        return state.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult Detect(const AccessStateConstPtr &state_ptr) const { return state_ptr->GetState().DetectHazard(usage_info_); }
+    HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
+        return state_ptr->GetState().DetectAsyncHazard(usage_info_, start_tag);
     }
     explicit HazardDetector(SyncStageAccessIndex usage_index) : usage_info_(SyncStageAccess::UsageInfo(usage_index)) {}
 };
@@ -38,11 +38,11 @@ class HazardDetectorWithOrdering {
     const SyncOrdering ordering_rule_;
 
   public:
-    HazardResult Detect(const ResourceAccessState &state) const {
-        return state.DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
+    HazardResult Detect(const AccessStateConstPtr &state_ptr) const {
+        return state_ptr->GetState().DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
     }
-    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
-        return state.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
+        return state_ptr->GetState().DetectAsyncHazard(usage_info_, start_tag);
     }
     HazardDetectorWithOrdering(SyncStageAccessIndex usage_index, SyncOrdering ordering)
         : usage_info_(SyncStageAccess::UsageInfo(usage_index)), ordering_rule_(ordering) {}
@@ -50,15 +50,17 @@ class HazardDetectorWithOrdering {
 
 class HazardDetectFirstUse {
   public:
-    HazardDetectFirstUse(const ResourceAccessState &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range)
+    HazardDetectFirstUse(const AccessStateConstPtr &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range)
         : recorded_use_(recorded_use), queue_id_(queue_id), tag_range_(tag_range) {}
-    HazardResult Detect(const ResourceAccessState &state) const { return state.DetectHazard(recorded_use_, queue_id_, tag_range_); }
-    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
-        return state.DetectAsyncHazard(recorded_use_, tag_range_, start_tag);
+    HazardResult Detect(const AccessStateConstPtr &state_ptr) const {
+        return state_ptr->GetState().DetectHazard(recorded_use_->GetState(), queue_id_, tag_range_);
+    }
+    HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
+        return state_ptr->GetState().DetectAsyncHazard(recorded_use_->GetState(), tag_range_, start_tag);
     }
 
   private:
-    const ResourceAccessState &recorded_use_;
+    const AccessStateConstPtr recorded_use_;
     const QueueId queue_id_;
     const ResourceUsageRange &tag_range_;
 };
@@ -102,20 +104,22 @@ void AccessContext::Trim(NormalizeOp &&normalize) {
 }
 
 void AccessContext::Trim() {
-    auto normalize = [](ResourceAccessRangeMap::value_type &access) { access.second.Normalize(); };
+    auto normalize = [](ResourceAccessRangeMap::value_type &access) { access.second->GetState().Normalize(); };
     Trim(normalize);
 }
 
 void AccessContext::TrimAndClearFirstAccess() {
     auto normalize = [](ResourceAccessRangeMap::value_type &access) {
-        access.second.Normalize();
-        access.second.ClearFirstUse();
+        access.second->GetState().Normalize();
+        access.second->GetState().ClearFirstUse();
     };
     Trim(normalize);
 }
 
 void AccessContext::AddReferencedTags(ResourceUsageTagSet &used) const {
-    auto gather = [&used](const ResourceAccessRangeMap::value_type &access) { access.second.GatherReferencedTags(used); };
+    auto gather = [&used](const ResourceAccessRangeMap::value_type &access) {
+        access.second->GetState().GatherReferencedTags(used);
+    };
     ConstForAll(gather);
 }
 
@@ -133,10 +137,7 @@ void AccessContext::ConstForAll(Action &&action) const {
     }
 }
 
-void AccessContext::ResolveFromContext(const AccessContext &from) {
-    const NoopBarrierAction noop_barrier;
-    ResolveFromContext(noop_barrier, from, nullptr);
-}
+void AccessContext::ResolveFromContext(const AccessContext &from) { ResolveAccessMaps(from.access_state_map_, access_state_map_); }
 
 // Non-lazy import of all accesses, WaitEvents needs this.
 void AccessContext::ResolvePreviousAccesses() {
@@ -336,12 +337,12 @@ class BarrierHazardDetector {
           src_exec_scope_(src_exec_scope),
           src_access_scope_(src_access_scope) {}
 
-    HazardResult Detect(const ResourceAccessState &state) const {
-        return state.DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
+    HazardResult Detect(const AccessStateConstPtr &state_ptr) const {
+        return state_ptr->GetState().DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
     }
-    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return state.DetectAsyncHazard(usage_info_, start_tag);
+        return state_ptr->GetState().DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
@@ -362,12 +363,12 @@ class EventScopeBarrierHazardDetector {
           src_access_scope_(src_access_scope),
           queue_id_(queue_id) {}
 
-    HazardResult Detect(const ResourceAccessState &state) {
-        return state.DetectBarrierHazard(usage_info_, queue_id_, src_exec_scope_, src_access_scope_);
+    HazardResult Detect(const AccessStateConstPtr &state_ptr) {
+        return state_ptr->GetState().DetectBarrierHazard(usage_info_, queue_id_, src_exec_scope_, src_access_scope_);
     }
-    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return state.DetectAsyncHazard(usage_info_, start_tag);
+        return state_ptr->GetState().DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
@@ -424,7 +425,7 @@ ResourceAccessRangeMap::iterator AccessContext::UpdateMemoryAccessStateFunctor::
     return accesses->lower_bound(range);
 }
 void AccessContext::UpdateMemoryAccessStateFunctor::operator()(const ResourceAccessRangeMap::iterator &pos) const {
-    auto &access_state = pos->second;
+    auto &access_state = pos->second->GetState();
     access_state.Update(usage_info, ordering_rule, tag);
 }
 
@@ -435,7 +436,7 @@ HazardResult AccessContext::DetectFirstUseHazard(QueueId queue_id, const Resourc
     HazardResult hazard;
     for (const auto &recorded_access : access_state_map_) {
         // Cull any entries not in the current tag range
-        if (!recorded_access.second.FirstAccessInTagRange(tag_range)) continue;
+        if (!recorded_access.second->GetState().FirstAccessInTagRange(tag_range)) continue;
         HazardDetectFirstUse detector(recorded_access.second, queue_id, tag_range);
         hazard = access_context.DetectHazardRange(detector, recorded_access.first, DetectOptions::kDetectAll);
         if (hazard.IsHazard()) break;
@@ -503,21 +504,22 @@ void AccessContext::ResolveAccessMaps(const ResourceAccessRangeMap &from, Resour
         const auto current_range = current->range;
         if (current->pos_B->valid) {
             const auto &src_pos = current->pos_B->lower_bound;
-            const ResourceAccessState &access = src_pos->second;
+            const ResourceAccessState &access = src_pos->second->GetState();
             if (current->pos_A->valid) {
                 const auto &dst_pos = current->pos_A->lower_bound;
                 if (dst_pos->first == current_range) {
                     // The current destination covers the current range, so we can just update it
-                    dst_pos->second.Resolve(access);
+                    dst_pos->second->GetState().Resolve(access);
                 } else {
                     // The current destination only partially matches current range, so split to only modify
                     // the intersection
                     const auto trimmed = sparse_container::split(current->pos_A->lower_bound, to, current_range);
-                    trimmed->second.Resolve(access);
+                    trimmed->second->GetState().Resolve(access);
                     current.invalidate_A(trimmed);
                 }
             } else {
-                auto inserted = to.insert(current->pos_A->lower_bound, std::make_pair(current_range, access));
+                auto inserted =
+                    to.insert(current->pos_A->lower_bound, std::make_pair(current_range, std::make_shared<AccessState>(access)));
                 current.invalidate_A(inserted);  // Update the parallel iterator to point at the insert segment
             }
         }
@@ -641,8 +643,9 @@ ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeG
             // Need to gap fill, because we suppressed it in the recurrent calls to avoid tree clutter.
             sparse_container::mapped_gap_generator gap_gen(resolved);
             sparse_container::intersection_generator infill_gen(gen_arg, gap_gen);
+            AccessStatePtr infill_shared(std::make_shared<AccessState>(*infill_state));
             for (; infill_gen->non_empty(); ++infill_gen) {
-                resolved.insert(infill_gen.get_second_gen().get_pos(), std::make_pair(*infill_gen, *infill_state));
+                resolved.insert(infill_gen.get_second_gen().get_pos(), std::make_pair(*infill_gen, infill_shared));
             }
         }
         return resolved;
@@ -663,13 +666,38 @@ ResourceAccessRangeMap AccessContext::InfillRangeGen(const RangeGen &gen_arg, co
             for (; !range_gen->empty(); ++range_gen) {
                 ResourceAccessState state_copy(*infill_state);
                 (*previous_barrier)(&state_copy);
-                previous_map.insert(previous_map.end(), ValueType(*range_gen, state_copy));
+                previous_map.insert(previous_map.end(), ValueType(*range_gen, std::make_shared<AccessState>(state_copy)));
             }
         } else {
+            AccessStatePtr infill_shared(std::make_shared<AccessState>(*infill_state));
             for (; !range_gen->empty(); ++range_gen) {
-                previous_map.insert(previous_map.end(), ValueType(*range_gen, *infill_state));
+                previous_map.insert(previous_map.end(), ValueType(*range_gen, infill_shared));
             }
         }
     }
     return previous_map;
+}
+
+AccessState::AccessState(const ResourceAccessState &copy_from, const AccessState *before) : state_(copy_from), next_(before) {
+    // Insert in linked list
+    if (before) {
+        if (before->prev_) {
+            before->prev_->next_ = this;
+        }
+        prev_ = before->prev_;
+        before->prev_ = this;
+    } else {
+        prev_ = nullptr;
+    }
+}
+
+AccessState::~AccessState() {
+    // Remove from linked list1G
+    if (prev_) {
+        prev_->next_ = next_;
+    }
+
+    if (next_) {
+        next_->prev_ = prev_;
+    }
 }

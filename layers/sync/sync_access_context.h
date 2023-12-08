@@ -32,6 +32,102 @@ class ImageViewState;
 bool SimpleBinding(const BINDABLE &bindable);
 VkDeviceSize ResourceBaseAddress(const vvl::Buffer &buffer);
 
+// AccessState:
+//
+// Encapsulate the ResourceAccess state for a given range into a shareable object, with meta-data allowing:
+//    * Single state assignment for all ranges with the same state
+//    * Single execution for all operations (Detection or Update) for a given access state
+//    * Global traversal of unique states, without traversing range map
+//
+// Theory of Operation:
+//    For each non-empty range in an access context, a shared_ptr to the state for that range is stored.  The goal
+//    is that for each unique state, only a single copy exists. (Note: The trade off for when, where, and how often
+//    duplicate states are combined is TBD.  Likely candidates include at the end of each ExecutionContext or AccessContext
+//    processing (for example after EndCommandBuffer, EndRenderPass, or after each queue batch completes).
+//
+// Traversal Operations
+//    When an access context Detect or Update operation traverses a tree, that operation is given a unique OpID (monotonically
+//    increasing integer).  During traversal, if a range state does not match the current OpID, the action (Detect or Update) is
+//    performed, and the AccessState update with the results (if any).  For Detect operations with *no* hazard detected, the
+//    AccessState is updated to refelct the current OpID.  Given that hazards terminate traversal, no updated state is needed.
+//    For Update operations,
+//        * the AccessState is duplicated.
+//        * the Update operation is performed on the duplicate
+//        * the original AccessState result is updated to refer to the updated state
+//        * the range's mapped value is updated to with the shared pointer to the updated state.
+//
+//    During traversal, if a range is encountered with an AccessState matching the OpID, the operations is
+//    treated as already performed.  For Detection traversal, the result is assumed to be "no hazard" since detection of a hazard
+//    terminates traversal.  For Update traversal the state associated with the result is taken as the new mapped_type value, and
+//    traversal continues.
+//
+// Global Operation Support
+//    Several (especially pre sync2) operations affect all entries in an AccessContext.  To optimize this, all AccessState objects
+//    are organized in a linked list.  The AccessContext range map's begin will point to an arbitrary location within this list,
+//    thus global operations are performed on begin() as well as walking the list in previous and next directions.
+//
+// Composite/Pending operations
+//    Note that for Vulkan operations that imply more than one Update, each specific Update will be treated independently.  This
+//    implies *specifically* that intermediatate states (such as those with pending_ field updates, resolutions) will be SSA
+//    copies.
+//
+// NOTE:
+//    Need to check performance on singly referenced AccessState, to see if modification in place is needed, and
+//    assessment the complexity, risk, and performance gains of allowing modification in place for those operations.
+//
+
+class AccessState {
+  public:
+    using OpID = uint64_t;
+    struct OpResult {
+        // Used to identify when a state has been accessed  during the current operation
+        // These fields are mutable to allow update during const traversal
+        OpID op = OpID(0);
+
+        // Needs to be a shared pointer as it is the value that will be copied to all nodes with a matching op tag
+        std::shared_ptr<const AccessState> state;
+    };
+
+    // TODO: WIP: Remove default argument to *not* allow isolated inserted
+    AccessState(const ResourceAccessState &state, const AccessState *insert_before = nullptr);
+    // Treat prev and next as mutable...
+    AccessState(const AccessState &other) : AccessState(other.state_, const_cast<AccessState *>(&other)) {}
+    ~AccessState();
+
+    const OpResult &GetResult() const { return result_; }
+    const ResourceAccessState &GetState() const { return state_; }
+    ResourceAccessState &GetState() { return state_; }
+
+    // NOTE: Updates mutable member, though const
+    void UpdateResult(OpResult &&from) const { result_ = std::move(from); }
+
+    template <typename Detector>
+    HazardResult DetectOp(OpID op_id, Detector &detector);
+
+    template <typename Updater>
+    void UpdateOp(OpID op_id, Updater &updater);
+
+  private:
+    // Treat the access state as a "static single assignment" of a ResourceAccessState, allowing safe sharing by many address
+    // ranges, with the results of a given op
+    // TODO: Make this const when we have constructors that can apply update operations during construction
+    ResourceAccessState state_;
+
+    // Linked list to allow global operations.
+    // NOTE: *NOT* in range map order
+    mutable const AccessState *prev_ = nullptr;  // Needed to support new global operations
+    mutable const AccessState *next_ = nullptr;
+
+    mutable OpResult result_;
+};
+
+using AccessStatePtr = std::shared_ptr<AccessState>;
+using AccessStateConstPtr = std::shared_ptr<const AccessState>;
+
+using ResourceAccessStateFunction = std::function<void(ResourceAccessState *)>;
+using ResourceAccessRangeMap = sparse_container::range_map<ResourceAddress, AccessStatePtr>;
+using ResourceRangeMergeIterator = sparse_container::parallel_iterator<ResourceAccessRangeMap, const ResourceAccessRangeMap>;
+
 using RangeGenWrapper = sparse_container::range_gen_wrapper<ResourceAccessRange>;
 using MapGapGen = sparse_container::mapped_gap_generator<ResourceAccessRangeMap>;
 using MapRangeGen = sparse_container::mapped_range_generator<ResourceAccessRangeMap>;
@@ -57,12 +153,12 @@ class ApplyBarrierOpsFunctor {
             return pos;
         }
         ResourceAccessState default_state;
-        auto inserted = accesses->insert(pos, std::make_pair(range, default_state));
+        auto inserted = accesses->insert(pos, std::make_pair(range, std::make_shared<AccessState>(default_state)));
         return inserted;
     }
 
     void operator()(const Iterator &pos) const {
-        auto &access_state = pos->second;
+        auto &access_state = pos->second->GetState();
         for (const auto &op : barrier_ops_) {
             op(&access_state);
         }
@@ -440,8 +536,26 @@ struct ActionToOpsAdapter {
             action(infill);
         }
     }
-    void update(const Iterator &pos) const { action(pos); }
+    void update(const Iterator &pos) const {
+        if (pos->second.use_count() > 1) {
+            pos->second = std::make_shared<AccessState>(*pos->second);
+        }
+        action(pos);
+    }
     const Action &action;
+};
+
+struct InfillOnlyOps {
+    using Map = ResourceAccessRangeMap;
+    using Range = typename Map::key_type;
+    using Iterator = typename Map::iterator;
+
+    void infill(Map &accesses, const Iterator &pos, const Range &infill_range) const {
+        // TODO WIP interface need to make insertion into the AccessState linked list easy
+        auto inserted = accesses.insert(pos, std::make_pair(infill_range, std::make_shared<AccessState>(infill_state)));
+    }
+    void update(const Iterator &pos) const {}
+    const ResourceAccessState &infill_state;
 };
 
 template <typename Action>
@@ -504,9 +618,9 @@ ResourceAccessRangeMap AccessContext::ResolveAccessRangeGen(const RangeGen &gen_
     sparse_container::intersection_generator range_gen(gen_arg, MapRangeGen(access_state_map_), IntersectionAdvanceSecond());
     for (; !range_gen->empty(); ++range_gen) {
         const auto &pos = range_gen.get_second_gen().get_pos();
-        ResourceAccessState access(pos->second);  // intentional copy
+        ResourceAccessState access(pos->second->GetState());  // intentional copy
         barrier_action(&access);
-        resolve_map.insert(resolve_map.end(), std::make_pair(pos->first, access));
+        resolve_map.insert(resolve_map.end(), std::make_pair(pos->first, std::make_shared<AccessState>(access)));
     }
 
     // Infill if range goes passed both the current and resolve map prior contents
