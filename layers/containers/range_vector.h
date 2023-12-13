@@ -2031,4 +2031,260 @@ void consolidate(RangeMap &map) {
     }
 }
 
+// Return the ranges of the range map, seekable
+template <typename Map>
+class mapped_range_generator {
+    using my_type = mapped_range_generator<Map>;
+    using map_type = Map;
+
+  public:
+    using iterator = typename map_type::const_iterator;
+    using key_type = typename map_type::key_type;
+    // using index_type = typename Map::index_type;
+    mapped_range_generator(const mapped_range_generator &other) = default;
+    mapped_range_generator(const map_type &map) : map_(map), pos_(map.cbegin()) { update_current(); }
+    mapped_range_generator(const map_type &map, const key_type &range) : map_(map), pos_(map.lower_bound(range)) {
+        update_current();
+    }
+    const key_type &operator*() const { return current_; }
+    const key_type *operator->() const { return &current_; }
+    my_type &operator++() {
+        assert(pos_ != map_.cend());
+        ++pos_;
+        update_current();
+        return *this;
+    }
+
+    const key_type &seek_forward(const key_type &range) {
+        const static int kRetryLimit = 2;  // TODO -- determine whether this limit is optimal
+        int retry_count = 0;
+        assert(pos_ != map_.cend());
+        while (!current_.empty() && (current_.end <= range.begin)) {
+            if (retry_count < kRetryLimit) {
+                ++pos_;
+            } else {
+                // Okay we've tried walking, do a seek.
+                pos_ = map_.lower_bound(range);
+            }
+            update_current();
+        }
+        return current_;
+    }
+
+  private:
+    void update_current() { current_ = (pos_ != map_.cend()) ? pos_->first : key_type(); }
+    const map_type &map_;
+    iterator pos_;
+    key_type current_;
+};
+
+template <typename Map>
+class mapped_gap_generator {
+    using my_type = mapped_gap_generator<Map>;
+    using map_type = Map;
+
+  public:
+    using iterator = typename map_type::const_iterator;
+    using key_type = typename map_type::key_type;
+    using index_type = typename Map::index_type;
+    const static index_type kMinIndex = std::numeric_limits<index_type>::min();
+    const static index_type kMaxIndex = std::numeric_limits<index_type>::max();
+    mapped_gap_generator(const mapped_gap_generator &other) = default;
+    mapped_gap_generator(const map_type &map) : map_(map), pos_() { seek_lower_bound_gap(key_type(kMinIndex, kMinIndex)); }
+    mapped_gap_generator(const map_type &map, const key_type &range) : map_(map), pos_() { seek_lower_bound_gap(range); }
+    const key_type &operator*() const { return current_; }
+    const key_type *operator->() const { return &current_; }
+    my_type &operator++() {
+        if (current_.end == kMaxIndex) {
+            assert(pos_ == map_.cend());
+            current_.begin = kMaxIndex;
+        } else {
+            if (pos_ == map_.cend()) {
+                return *this;
+            }
+            assert(pos_ != map_.cend());
+            seek_next_gap();
+        }
+        return *this;
+    }
+
+    const key_type &seek_forward(const key_type &range) {
+        seek_lower_bound_gap(range);
+        return current_;
+    }
+
+  private:
+    // Always returns a gap.end = lb.begin (suitable for "seek_next_gap" below)
+    key_type gap_before_lower_bound(const key_type &range, const iterator &lb) {
+        assert(lb == map_.lower_bound(range));
+        assert(lb != map_.cend());
+        //     the gap before can only be a "lower_bound gap" if gap.end (and thus lb.begin) > range.begin
+        //     Since lb is lower bound -- a gap before can be found with an single step -- walk:
+        //     by definition:
+        //         lb.end > range.begin (or lb == map.end)
+        //         (lb - 1).end <= range.begin (if lb not at begin)
+        //     Gap before require a *gap* (lb -1).end < (strictly) lb.begin
+        const key_type &lb_range = lb->first;
+
+        // gap is empty unless we find one, but consistent with current_ and pos_ usage for "seek next" operations
+        key_type gap = {lb_range.begin, lb_range.begin};
+
+        if (gap.end > range.begin) {
+            // room for a lower bound gap...
+            if (lb == map_.cbegin()) {
+                // Which extends to the beginnging of the index_type space.
+                gap.begin = kMinIndex;
+            } else {
+                // If there is no gap between prev and lb, gap will be empty and the caller will handle the condition
+                iterator prev = lb;
+                --prev;
+                gap.begin = prev->first.end;
+            }
+        }
+        return gap;
+    }
+
+    // Find the next gap
+    void seek_next_gap() {
+        const iterator map_end = map_.cend();
+        assert(pos_ != map_end);
+        assert(current_.end == pos_->first.begin);
+
+        // Set gap in case pos_ is cend() - 1
+        current_.begin = pos_->first.end;
+        current_.end = kMaxIndex;
+        ++pos_;
+
+        while (pos_ != map_end) {
+            const key_type &range = pos_->first;
+            if (range.begin > current_.begin) {
+                current_.end = range.begin;
+                break;
+            }
+
+            // Update for both next iteration an loop termination (note that current_.end is still kMaxIndex)
+            current_.begin = range.end;
+            ++pos_;
+        }
+    }
+
+    void seek_lower_bound_gap(const key_type &range) {
+        pos_ = map_.lower_bound(range);
+        // Handle "at end" special cases
+        if (map_.cend() == pos_) {
+            if (map_.cbegin() == pos_) {
+                // empty map -- full index_type range
+                current_ = key_type{kMinIndex, kMaxIndex};
+            } else {
+                // map isn't empty, pos_ is at end
+                --pos_;
+                // Trailing gap
+                current_ = key_type{pos_->first.end, kMaxIndex};
+                pos_ = map_.cend();
+            }
+        } else {
+            current_ = gap_before_lower_bound(range, pos_);
+            if (current_.empty()) {
+                seek_next_gap();
+            }
+        }
+    }
+
+    const map_type &map_;
+    iterator pos_;
+    key_type current_;
+};
+
+template <typename GenA, typename GenB>
+class intersection_generator {
+    using my_type = intersection_generator<GenA, GenB>;
+
+  public:
+    using key_type = typename GenA::key_type;
+    using index_type = typename key_type::index_type;
+    const static index_type kMinIndex = std::numeric_limits<index_type>::min();
+    const static index_type kMaxIndex = std::numeric_limits<index_type>::max();
+
+    intersection_generator(const GenA &gen_a, const GenB &gen_b) : gen_a_(gen_a), gen_b_(gen_b) { find_intersection(); }
+    intersection_generator(const intersection_generator &other) = default;
+    const key_type &operator*() const { return current_; }
+    const key_type *operator->() const { return &current_; }
+
+    my_type &operator++() {
+        assert(!current_.empty());
+        assert(!gen_a_->empty() && !gen_b_->empty());
+        if (gen_a_->end < gen_b_->end) {
+            ++gen_a_;
+        } else {
+            ++gen_b_;
+        }
+        find_intersection();
+
+        return *this;
+    }
+
+    const key_type &seek_forward(const key_type &range) {
+        gen_a_.seek_forward(range);
+        gen_b_.seek_forward(range);
+        find_intersection();
+
+        return current_;
+    }
+
+  private:
+    void find_intersection() {
+        current_ = *gen_a_ & *gen_b_;
+        // Play leapfrog with the generators until they intersect
+        while (!gen_a_->empty() && !gen_b_->empty() && current_.empty()) {
+            //
+            if (gen_a_->end <= gen_b_->begin) {
+                gen_a_.seek_forward(*gen_b_);
+            } else {
+                gen_b_.seek_forward(*gen_a_);
+            }
+            current_ = *gen_a_ & *gen_b_;
+        }
+    }
+
+    GenA gen_a_;
+    GenB gen_b_;
+    key_type current_;
+};
+
+// Adapter to give a single range generator semantics
+template <typename Range>
+class single_range_generator {
+    using my_type = single_range_generator<Range>;
+
+  public:
+    using key_type = Range;
+    using index_type = typename key_type::index_type;
+    const static index_type kMinIndex = std::numeric_limits<index_type>::min();
+    const static index_type kMaxIndex = std::numeric_limits<index_type>::max();
+
+    single_range_generator(const key_type &range) : current_(range) {}
+    single_range_generator(const single_range_generator &other) = default;
+    const key_type &operator*() const { return current_; }
+    const key_type *operator->() const { return &current_; }
+
+    my_type &operator++() {
+        assert(!current_.empty());
+        // Just one range
+        set_to_end();
+        return *this;
+    }
+
+    const key_type &seek_forward(const key_type &range) {
+        // If current is less than sought range, logically we'd have to advance, but there is no advance
+        if (current_.end <= range.begin) {
+            set_to_end();
+        }
+        return current_;
+    }
+
+  private:
+    void set_to_end() { current_ = key_type{kMaxIndex, kMaxIndex}; }
+    key_type current_;
+};
+
 }  // namespace sparse_container

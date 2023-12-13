@@ -183,6 +183,7 @@ target_sources(vk_layer_validation_tests PRIVATE
     unit/ycbcr.cpp
     unit/ycbcr_positive.cpp
     vvl_utils/small_vector.cpp
+    vvl_utils/range_map.cpp
     vvl_utils/pnext_chain_extraction.cpp
 )
 get_target_property(TEST_SOURCES vk_layer_validation_tests SOURCES)

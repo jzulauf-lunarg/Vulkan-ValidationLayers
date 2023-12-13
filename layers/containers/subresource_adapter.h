@@ -408,6 +408,7 @@ class ImageRangeEncoder : public RangeEncoder {
 class ImageRangeGenerator {
   public:
     using RangeType = IndexRange;
+    using key_type = RangeType;
     ImageRangeGenerator(const ImageRangeGenerator&) = default;
     ImageRangeGenerator() : encoder_(nullptr), subres_range_(), offset_(), extent_(), base_address_(), pos_() {}
     ImageRangeGenerator(const ImageRangeEncoder& encoder, const VkImageSubresourceRange& subres_range, const VkOffset3D& offset,
@@ -427,6 +428,16 @@ class ImageRangeGenerator {
     inline const IndexRange* operator->() const { return &pos_; }
     ImageRangeGenerator& operator++();
     ImageRangeGenerator& operator=(const ImageRangeGenerator&) = default;
+
+    // Support range generator seek operations -- the sparse container *meta* range generators only require forward seeking,
+    // not general seeking.
+    const key_type& seek_forward(const key_type& range) {
+        // Note: If this shows up in profiling, see if some fast forwarding like lower_bound is possible...
+        while (!pos_.empty() && (pos_.end <= range.begin)) {
+            ++(*this);
+        }
+        return pos_;
+    }
 
   private:
     bool Convert2DCompatibleTo3D();
