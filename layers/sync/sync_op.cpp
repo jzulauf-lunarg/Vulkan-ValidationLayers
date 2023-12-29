@@ -36,53 +36,21 @@ template <typename RangeMap, typename KeyType = typename RangeMap::key_type>
 class MapRangesRangeGenerator {
   public:
     // Default constructed is safe to dereference for "empty" test, but for no other operation.
-    MapRangesRangeGenerator() : range_(), map_(nullptr), map_pos_(), current_() {
-        // Default construction for KeyType *must* be empty range
-        assert(current_.empty());
-    }
-    MapRangesRangeGenerator(const RangeMap &filter, const KeyType &range) : range_(range), map_(&filter), map_pos_(), current_() {
-        SeekBegin();
-    }
+    MapRangesRangeGenerator(const RangeMap &map, const KeyType &range) : gen_(MapGen(map), RangeGen(range)) {}
     MapRangesRangeGenerator(const MapRangesRangeGenerator &from) = default;
 
-    const KeyType &operator*() const { return current_; }
-    const KeyType *operator->() const { return &current_; }
+    const KeyType &operator*() const { return *gen_; }
+    const KeyType *operator->() const { return &(*gen_); }
     MapRangesRangeGenerator &operator++() {
-        ++map_pos_;
-        UpdateCurrent();
+        ++gen_;
         return *this;
     }
-
-    bool operator==(const MapRangesRangeGenerator &other) const { return current_ == other.current_; }
 
   protected:
-    void UpdateCurrent() {
-        if (map_pos_ != map_->cend()) {
-            current_ = range_ & map_pos_->first;
-        } else {
-            current_ = KeyType();
-        }
-    }
-    void SeekBegin() {
-        map_pos_ = map_->lower_bound(range_);
-        UpdateCurrent();
-    }
-
-    // Adding this functionality here, to avoid gratuitous Base:: qualifiers in the derived class
-    // Note: Not exposed in this classes public interface to encourage using a consistent ++/empty generator semantic
-    template <typename Pred>
-    MapRangesRangeGenerator &PredicatedIncrement(Pred &pred) {
-        do {
-            ++map_pos_;
-        } while (map_pos_ != map_->cend() && map_pos_->first.intersects(range_) && !pred(map_pos_));
-        UpdateCurrent();
-        return *this;
-    }
-
-    const KeyType range_;
-    const RangeMap *map_;
-    typename RangeMap::const_iterator map_pos_;
-    KeyType current_;
+    using MapGen = sparse_container::mapped_range_generator<RangeMap>;
+    using RangeGen = sparse_container::single_range_generator<KeyType>;
+    using IntersectionGen = sparse_container::intersection_generator<MapGen, RangeGen>;
+    IntersectionGen gen_;
 };
 using EventSimpleRangeGenerator = MapRangesRangeGenerator<AccessContext::ScopeMap>;
 
@@ -91,100 +59,19 @@ using EventSimpleRangeGenerator = MapRangesRangeGenerator<AccessContext::ScopeMa
 template <typename RangeMap, typename RangeGen, typename KeyType = typename RangeMap::key_type>
 class FilteredGeneratorGenerator {
   public:
-    // Default constructed is safe to dereference for "empty" test, but for no other operation.
-    FilteredGeneratorGenerator() : filter_(nullptr), gen_(), filter_pos_(), current_() {
-        // Default construction for KeyType *must* be empty range
-        assert(current_.empty());
-    }
-    FilteredGeneratorGenerator(const RangeMap &filter, RangeGen &gen) : filter_(&filter), gen_(gen), filter_pos_(), current_() {
-        SeekBegin();
-    }
+    FilteredGeneratorGenerator(const RangeMap &map, const RangeGen &gen) : gen_(MapGen(map), gen) {}
     FilteredGeneratorGenerator(const FilteredGeneratorGenerator &from) = default;
-    const KeyType &operator*() const { return current_; }
-    const KeyType *operator->() const { return &current_; }
+    const KeyType &operator*() const { return *gen_; }
+    const KeyType *operator->() const { return &(*gen_); }
     FilteredGeneratorGenerator &operator++() {
-        KeyType gen_range = GenRange();
-        KeyType filter_range = FilterRange();
-        current_ = KeyType();
-        while (gen_range.non_empty() && filter_range.non_empty() && current_.empty()) {
-            if (gen_range.end > filter_range.end) {
-                // if the generated range is beyond the filter_range, advance the filter range
-                filter_range = AdvanceFilter();
-            } else {
-                gen_range = AdvanceGen();
-            }
-            current_ = gen_range & filter_range;
-        }
+        ++gen_;
         return *this;
     }
 
-    bool operator==(const FilteredGeneratorGenerator &other) const { return current_ == other.current_; }
-
-  private:
-    KeyType AdvanceFilter() {
-        ++filter_pos_;
-        auto filter_range = FilterRange();
-        if (filter_range.valid()) {
-            FastForwardGen(filter_range);
-        }
-        return filter_range;
-    }
-    KeyType AdvanceGen() {
-        ++gen_;
-        auto gen_range = GenRange();
-        if (gen_range.valid()) {
-            FastForwardFilter(gen_range);
-        }
-        return gen_range;
-    }
-
-    KeyType FilterRange() const { return (filter_pos_ != filter_->cend()) ? filter_pos_->first : KeyType(); }
-    KeyType GenRange() const { return *gen_; }
-
-    KeyType FastForwardFilter(const KeyType &range) {
-        auto filter_range = FilterRange();
-        int retry_count = 0;
-        const static int kRetryLimit = 2;  // TODO -- determine whether this limit is optimal
-        while (!filter_range.empty() && (filter_range.end <= range.begin)) {
-            if (retry_count < kRetryLimit) {
-                ++filter_pos_;
-                filter_range = FilterRange();
-                retry_count++;
-            } else {
-                // Okay we've tried walking, do a seek.
-                filter_pos_ = filter_->lower_bound(range);
-                break;
-            }
-        }
-        return FilterRange();
-    }
-
-    // TODO: Consider adding "seek" (or an absolute bound "get" to range generators to make this walk
-    // faster.
-    KeyType FastForwardGen(const KeyType &range) {
-        auto gen_range = GenRange();
-        while (!gen_range.empty() && (gen_range.end <= range.begin)) {
-            ++gen_;
-            gen_range = GenRange();
-        }
-        return gen_range;
-    }
-
-    void SeekBegin() {
-        auto gen_range = GenRange();
-        if (gen_range.empty()) {
-            current_ = KeyType();
-            filter_pos_ = filter_->cend();
-        } else {
-            filter_pos_ = filter_->lower_bound(gen_range);
-            current_ = gen_range & FilterRange();
-        }
-    }
-
-    const RangeMap *filter_;
-    RangeGen gen_;
-    typename RangeMap::const_iterator filter_pos_;
-    KeyType current_;
+  protected:
+    using MapGen = sparse_container::mapped_range_generator<RangeMap>;
+    using IntersectionGen = sparse_container::intersection_generator<MapGen, RangeGen>;
+    IntersectionGen gen_;
 };
 
 using EventImageRangeGenerator = FilteredGeneratorGenerator<AccessContext::ScopeMap, subresource_adapter::ImageRangeGenerator>;
@@ -276,9 +163,9 @@ struct SyncOpPipelineBarrierFunctorFactory {
     using ApplyFunctor = ApplyBarrierFunctor<BarrierOpFunctor>;
     using GlobalBarrierOpFunctor = PipelineBarrierOp;
     using GlobalApplyFunctor = ApplyBarrierOpsFunctor<GlobalBarrierOpFunctor>;
-    using BufferRange = SingleRangeGenerator<ResourceAccessRange>;
+    using BufferRange = sparse_container::single_range_generator<ResourceAccessRange>;
     using ImageRange = subresource_adapter::ImageRangeGenerator;
-    using GlobalRange = SingleRangeGenerator<ResourceAccessRange>;
+    using GlobalRange = sparse_container::single_range_generator<ResourceAccessRange>;
     using ImageState = syncval_state::ImageState;
 
     ApplyFunctor MakeApplyFunctor(QueueId queue_id, const SyncBarrier &barrier, bool layout_transition) const {

@@ -465,7 +465,7 @@ void RenderPassAccessContext::RecordLayoutTransitions(const vvl::RenderPass &rp_
         const std::optional<ImageRangeGen> &attachment_gen = view_gen.GetRangeGen(AttachmentViewGen::Gen::kViewSubresource);
         assert(attachment_gen);
 
-        access_context.ResolveFromContext(barrier_action, *prev_context, *attachment_gen, &empty_infill,
+        access_context.ResolveFromContext(barrier_action, *attachment_gen, *prev_context, &empty_infill,
                                           true /* recur to infill */);
         assert(attachment_gen);
     }

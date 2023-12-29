@@ -26,9 +26,9 @@ class HazardDetector {
     const SyncStageAccessInfoType &usage_info_;
 
   public:
-    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) const { return pos->second.DetectHazard(usage_info_); }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos, ResourceUsageTag start_tag) const {
-        return pos->second.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const { return value.second.DetectHazard(usage_info_); }
+    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
+        return value.second.DetectAsyncHazard(usage_info_, start_tag);
     }
     explicit HazardDetector(SyncStageAccessIndex usage_index) : usage_info_(SyncStageAccess::UsageInfo(usage_index)) {}
 };
@@ -38,11 +38,11 @@ class HazardDetectorWithOrdering {
     const SyncOrdering ordering_rule_;
 
   public:
-    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) const {
-        return pos->second.DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
+    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
+        return value.second.DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
     }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos, ResourceUsageTag start_tag) const {
-        return pos->second.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
+        return value.second.DetectAsyncHazard(usage_info_, start_tag);
     }
     HazardDetectorWithOrdering(SyncStageAccessIndex usage_index, SyncOrdering ordering)
         : usage_info_(SyncStageAccess::UsageInfo(usage_index)), ordering_rule_(ordering) {}
@@ -52,11 +52,11 @@ class HazardDetectFirstUse {
   public:
     HazardDetectFirstUse(const ResourceAccessState &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range)
         : recorded_use_(recorded_use), queue_id_(queue_id), tag_range_(tag_range) {}
-    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) const {
-        return pos->second.DetectHazard(recorded_use_, queue_id_, tag_range_);
+    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
+        return value.second.DetectHazard(recorded_use_, queue_id_, tag_range_);
     }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos, ResourceUsageTag start_tag) const {
-        return pos->second.DetectAsyncHazard(recorded_use_, tag_range_, start_tag);
+    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
+        return value.second.DetectAsyncHazard(recorded_use_, tag_range_, start_tag);
     }
 
   private:
@@ -137,32 +137,7 @@ void AccessContext::ConstForAll(Action &&action) const {
 
 void AccessContext::ResolveFromContext(const AccessContext &from) {
     const NoopBarrierAction noop_barrier;
-    from.ResolveAccessRange(kFullRange, noop_barrier, &access_state_map_, nullptr);
-}
-
-void AccessContext::ResolvePreviousAccess(const ResourceAccessRange &range, ResourceAccessRangeMap *descent_map,
-                                          const ResourceAccessState *infill_state,
-                                          const ResourceAccessStateFunction *previous_barrier) const {
-    if (prev_.size() == 0) {
-        if (range.non_empty() && infill_state) {
-            // Fill the empty poritions of descent_map with the default_state with the barrier function applied (iff present)
-            ResourceAccessState state_copy;
-            if (previous_barrier) {
-                assert(bool(*previous_barrier));
-                state_copy = *infill_state;
-                (*previous_barrier)(&state_copy);
-                infill_state = &state_copy;
-            }
-            sparse_container::update_range_value(*descent_map, range, *infill_state,
-                                                 sparse_container::value_precedence::prefer_dest);
-        }
-    } else {
-        // Look for something to fill the gap further along.
-        for (const auto &prev_dep : prev_) {
-            const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
-            prev_dep.source_subpass->ResolveAccessRange(range, barrier_action, descent_map, infill_state);
-        }
-    }
+    ResolveFromContext(noop_barrier, from, nullptr);
 }
 
 // Non-lazy import of all accesses, WaitEvents needs this.
@@ -170,7 +145,8 @@ void AccessContext::ResolvePreviousAccesses() {
     ResourceAccessState default_state;
     if (!prev_.size()) return;  // If no previous contexts, nothing to do
 
-    ResolvePreviousAccess(kFullRange, &access_state_map_, &default_state);
+    ResolveAccessMaps(ResolvePreviousAccessRangeGen(RangeGenWrapper(MapGapGen(access_state_map_)), &default_state, nullptr),
+                      access_state_map_);
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer &buffer, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
@@ -235,7 +211,7 @@ void AccessContext::ResolveChildContexts(const std::vector<AccessContext> &conte
     for (uint32_t subpass_index = 0; subpass_index < contexts.size(); subpass_index++) {
         auto &context = contexts[subpass_index];
         ApplyTrackbackStackAction barrier_action(context.GetDstExternalTrackBack().barriers);
-        context.ResolveAccessRange(kFullRange, barrier_action, &access_state_map_, nullptr, false);
+        ResolveFromContext(barrier_action, context, nullptr, false);
     }
 }
 
@@ -362,12 +338,12 @@ class BarrierHazardDetector {
           src_exec_scope_(src_exec_scope),
           src_access_scope_(src_access_scope) {}
 
-    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) const {
-        return pos->second.DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
+    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
+        return value.second.DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
     }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return pos->second.DetectAsyncHazard(usage_info_, start_tag);
+        return value.second.DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
@@ -390,11 +366,11 @@ class EventBarrierHazardDetector {
           scope_pos_(event_scope.cbegin()),
           scope_end_(event_scope.cend()) {}
 
-    HazardResult Detect(const ResourceAccessRangeMap::const_iterator &pos) {
+    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) {
         // Need to piece together coverage of pos->first range:
         // Copy the range as we'll be chopping it up as needed
-        ResourceAccessRange range = pos->first;
-        const ResourceAccessState &access = pos->second;
+        ResourceAccessRange range = value.first;  // Intentional copy
+        const ResourceAccessState &access = value.second;
         HazardResult hazard;
 
         bool in_scope = AdvanceScope(range);
@@ -423,9 +399,9 @@ class EventBarrierHazardDetector {
         return hazard;
     }
 
-    HazardResult DetectAsync(const ResourceAccessRangeMap::const_iterator &pos, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return pos->second.DetectAsyncHazard(usage_info_, start_tag);
+        return value.second.DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
@@ -496,7 +472,7 @@ ResourceAccessRangeMap::iterator AccessContext::UpdateMemoryAccessStateFunctor::
                                                                                        const ResourceAccessRange &range) const {
     // this is only called on gaps, and never returns a gap.
     ResourceAccessState default_state;
-    context.ResolvePreviousAccess(range, accesses, &default_state);
+    ResolveAccessMaps(context.ResolvePreviousAccessRangeGen(SingleRangeGen(range), &default_state, nullptr), *accesses);
     return accesses->lower_bound(range);
 }
 void AccessContext::UpdateMemoryAccessStateFunctor::operator()(const ResourceAccessRangeMap::iterator &pos) const {
@@ -571,4 +547,155 @@ AttachmentViewGen::Gen AttachmentViewGen::GetDepthStencilRenderAreaGenType(bool 
 
     assert(depth_op || stencil_op);
     return kRenderArea;
+}
+
+void AccessContext::ResolveAccessMaps(const ResourceAccessRangeMap &from, ResourceAccessRangeMap &to) {
+    ResourceRangeMergeIterator current(to, from, 0);
+    while (current->range.non_empty()) {
+        const auto current_range = current->range;
+        if (current->pos_B->valid) {
+            const auto &src_pos = current->pos_B->lower_bound;
+            const ResourceAccessState &access = src_pos->second;
+            if (current->pos_A->valid) {
+                const auto &dst_pos = current->pos_A->lower_bound;
+                if (dst_pos->first == current_range) {
+                    // The current destination covers the current range, so we can just update it
+                    dst_pos->second.Resolve(access);
+                } else {
+                    // The current destination only partially matches current range, so split to only modify
+                    // the intersection
+                    const auto trimmed = sparse_container::split(current->pos_A->lower_bound, to, current_range);
+                    trimmed->second.Resolve(access);
+                    current.invalidate_A(trimmed);
+                }
+            } else {
+                auto inserted = to.insert(current->pos_A->lower_bound, std::make_pair(current_range, access));
+                current.invalidate_A(inserted);  // Update the parallel iterator to point at the insert segment
+            }
+        }
+        // neither the insert, nor the trim should cause pointing to an empty range
+        assert(current->range.non_empty());
+        ++current;
+    }
+}
+
+// A non recursive range walker for the asynchronous contexts (those we have no barriers with)
+template <typename Detector, typename RangeGen>
+HazardResult AccessContext::DetectAsyncHazard(const Detector &detector, const RangeGen &const_range_gen,
+                                              ResourceUsageTag async_tag) const {
+    HazardResult hazard;
+
+    sparse_container::intersection_generator range_gen(const_range_gen, MapRangeGen(access_state_map_),
+                                                       IntersectionAdvanceSecond());
+    for (; range_gen->non_empty(); ++range_gen) {
+        hazard = detector.DetectAsync(*range_gen.get_second_gen().get_pos(), async_tag);
+        if (hazard.IsHazard()) break;
+    }
+
+    return hazard;
+}
+
+// A recursive range walker for hazard detection, first for the current context and the (DetectHazardRecur) to walk
+// the DAG of the contexts (for example subpasses)
+template <typename Detector, typename RangeGen>
+HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, RangeGen &range_gen, DetectOptions options) const {
+    HazardResult hazard;
+
+    // Do this before range_gen is incremented s.t. the copies used will be correct
+    if (static_cast<uint32_t>(options) & DetectOptions::kDetectAsync) {
+        // Async checks don't require recursive lookups, as the async lists are exhaustive for the top-level context
+        // so we'll check these first
+        for (const auto &async_ref : async_) {
+            hazard = async_ref.Context().DetectAsyncHazard(detector, range_gen, async_ref.StartTag());
+            if (hazard.IsHazard()) return hazard;
+        }
+    }
+
+    sparse_container::mapped_range_generator map_gen(access_state_map_);
+    sparse_container::intersection_generator hazard_gen(range_gen, map_gen);
+    for (; !hazard_gen->empty(); ++hazard_gen) {
+        hazard = detector.Detect(*hazard_gen.get_second_gen().get_pos());
+        if (hazard.IsHazard()) return hazard;
+    }
+
+    const bool detect_prev = (static_cast<uint32_t>(options) & DetectOptions::kDetectPrevious) != 0;
+    if (detect_prev) {
+        // Only look in locations where there are no values (i.e. in gaps in the current map
+        sparse_container::mapped_gap_generator gap_gen(access_state_map_);
+        sparse_container::intersection_generator prev_gen(range_gen, gap_gen);
+        auto prev_access_map = ResolvePreviousAccessRangeGen(prev_gen, nullptr, nullptr);
+        for (const auto &prev : prev_access_map) {
+            hazard = detector.Detect(prev);
+            if (hazard.IsHazard()) return hazard;
+        }
+    }
+
+    return hazard;
+}
+
+ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeGenWrapper &gen_arg,
+                                                                    const ResourceAccessState *infill_state,
+                                                                    const ResourceAccessStateFunction *previous_barrier) const {
+    if (prev_.size() == 0) {
+        return InfillRangeGen(gen_arg, previous_barrier, infill_state);
+    } else {
+        std::vector<ResourceAccessRangeMap> previous;
+        previous.reserve(prev_.size());
+        // Look for something to fill the gap further along.
+        for (const auto &prev_dep : prev_) {
+            const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
+            sparse_container::intersection_generator prev_gen(sparse_container::mapped_gap_generator(access_state_map_), gen_arg);
+            previous.emplace_back(prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, infill_state, true));
+        }
+
+        // Log2 N reduction of the previous (if more than one)
+        // Use a stack variable to allow RCE to run, not sure that REC could would with an entry of a std::vector
+        ResourceAccessRangeMap resolved;
+        std::vector<ResourceAccessRangeMap *> resolve_maps;
+        resolve_maps.reserve(previous.size() + 1);
+        resolve_maps.push_back(&resolved);
+        for (auto &prev_map : previous) {
+            resolve_maps.push_back(&prev_map);
+        }
+
+        while (resolve_maps.size() > 1) {
+            size_t size = resolve_maps.size();
+            size_t limit = size - 1;
+            size_t half = size / 2;
+            for (size_t lower = 0; lower < half; lower++) {
+                // Result is second map
+                ResolveAccessMaps(*resolve_maps[limit - lower], *resolve_maps[lower]);
+            }
+            // Get rid of the half that was resolved (
+            resolve_maps.resize(size - half);
+        }
+        assert(resolve_maps.size() == 1);
+        assert(resolve_maps[0] == &resolved);
+        return resolved;
+    }
+}
+
+template <typename RangeGen>
+ResourceAccessRangeMap AccessContext::InfillRangeGen(const RangeGen &gen_arg, const ResourceAccessStateFunction *previous_barrier,
+                                                     const ResourceAccessState *infill_state) {
+    using ValueType = ResourceAccessRangeMap::value_type;
+    ResourceAccessRangeMap previous_map;
+    if (infill_state) {
+        RangeGen range_gen(gen_arg);
+        if (previous_barrier) {
+            // Avoid inner loop logic with a litte duplication of the "if barrier" logic.
+            // This is needed because the previous_barrier could be an ILT which changes read/write, not just barriers
+            // or the infill state might *have* a valid read or write, which needs some barrier effect.
+            for (; !range_gen->empty(); ++range_gen) {
+                ResourceAccessState state_copy(*infill_state);
+                (*previous_barrier)(&state_copy);
+                previous_map.insert(previous_map.end(), ValueType(*range_gen, state_copy));
+            }
+        } else {
+            for (; !range_gen->empty(); ++range_gen) {
+                previous_map.insert(previous_map.end(), ValueType(*range_gen, *infill_state));
+            }
+        }
+    }
+    return previous_map;
 }

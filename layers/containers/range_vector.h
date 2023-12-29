@@ -24,6 +24,7 @@
 #include <cassert>
 #include <limits>
 #include <map>
+#include <memory>
 #include <string>
 #include <sstream>
 #include <utility>
@@ -2071,6 +2072,10 @@ class mapped_range_generator {
         return current_;
     }
 
+    // Note, just because you've got access to an iterator, doesn't mean it's safe to change then underlying map.
+    // points to the map entry used for the current range
+    const iterator &get_pos() const { return pos_; };
+
   private:
     void update_current() { current_ = (pos_ != map_.cend()) ? pos_->first : key_type(); }
     const map_type &map_;
@@ -2112,6 +2117,10 @@ class mapped_gap_generator {
         seek_lower_bound_gap(range);
         return current_;
     }
+
+    // Note, just because you've got access to an iterator, doesn't mean it's safe to change the underlying map.
+    // points to the map position *after* the current gap
+    const iterator &get_pos() { return pos_; };
 
   private:
     // Always returns a gap.end = lb.begin (suitable for "seek_next_gap" below)
@@ -2195,17 +2204,35 @@ class mapped_gap_generator {
     key_type current_;
 };
 
-template <typename GenA, typename GenB>
+enum class intersection_advance_policy { least, first, second, both };
+
+template <intersection_advance_policy Policy>
+struct intersection_advance_policy_trait {
+    static constexpr intersection_advance_policy policy = Policy;
+};
+
+using intersection_advance_policy_least = intersection_advance_policy_trait<intersection_advance_policy::least>;
+using intersection_advance_policy_first = intersection_advance_policy_trait<intersection_advance_policy::first>;
+using intersection_advance_policy_second = intersection_advance_policy_trait<intersection_advance_policy::second>;
+using intersection_advance_policy_both = intersection_advance_policy_trait<intersection_advance_policy::both>;
+
+template <typename GenA, typename GenB, typename AdvancePolicy = intersection_advance_policy_least>
 class intersection_generator {
-    using my_type = intersection_generator<GenA, GenB>;
+    using my_type = intersection_generator<GenA, GenB, AdvancePolicy>;
 
   public:
     using key_type = typename GenA::key_type;
     using index_type = typename key_type::index_type;
+    using generator_first = GenA;
+    using generator_second = GenB;
     const static index_type kMinIndex = std::numeric_limits<index_type>::min();
     const static index_type kMaxIndex = std::numeric_limits<index_type>::max();
 
-    intersection_generator(const GenA &gen_a, const GenB &gen_b) : gen_a_(gen_a), gen_b_(gen_b) { find_intersection(); }
+    intersection_generator(const GenA &gen_a, const GenB &gen_b, const AdvancePolicy * = nullptr) : gen_a_(gen_a), gen_b_(gen_b) {
+        find_intersection();
+    }
+    intersection_generator(const GenA &gen_a, const GenB &gen_b, const AdvancePolicy &)
+        : intersection_generator(gen_a, gen_b, nullptr) {}
     intersection_generator(const intersection_generator &other) = default;
     const key_type &operator*() const { return current_; }
     const key_type *operator->() const { return &current_; }
@@ -2213,10 +2240,27 @@ class intersection_generator {
     my_type &operator++() {
         assert(!current_.empty());
         assert(!gen_a_->empty() && !gen_b_->empty());
-        if (gen_a_->end < gen_b_->end) {
-            ++gen_a_;
-        } else {
-            ++gen_b_;
+        switch (AdvancePolicy::policy) {
+            case intersection_advance_policy::least:
+                if (gen_a_->end < gen_b_->end) {
+                    ++gen_a_;
+                } else {
+                    ++gen_b_;
+                }
+                break;
+
+            case intersection_advance_policy::first:
+                ++gen_a_;
+                break;
+
+            case intersection_advance_policy::second:
+                ++gen_b_;
+                break;
+
+            case intersection_advance_policy::both:
+                ++gen_a_;
+                ++gen_b_;
+                break;
         }
         find_intersection();
 
@@ -2230,6 +2274,9 @@ class intersection_generator {
 
         return current_;
     }
+
+    const generator_first &get_first_gen() const { return gen_a_; }
+    const generator_second &get_second_gen() const { return gen_b_; }
 
   private:
     void find_intersection() {
@@ -2285,6 +2332,83 @@ class single_range_generator {
   private:
     void set_to_end() { current_ = key_type{kMaxIndex, kMaxIndex}; }
     key_type current_;
+};
+
+// When recursively calling down through functions that are building up
+// different range generation/intersection/filters etc., to prevent infinite type
+// expansion recursion need to have a non-templated type.
+//
+// Given the virtual function call and dynamic allocation overhead, probably *only* want to use this
+// in recursive calling patterns.
+template <typename Range>
+class range_gen_wrapper {
+  public:
+    using key_type = Range;
+    struct gen_store_interface {
+        // The object managment interface
+        virtual std::unique_ptr<gen_store_interface> clone() const = 0;
+        virtual ~gen_store_interface(){};
+
+        // The generator interface
+        virtual const key_type &operator*() const = 0;
+        virtual const key_type *operator->() const = 0;
+        virtual gen_store_interface &operator++() = 0;
+        virtual const key_type &seek_forward(const key_type &range) = 0;
+    };
+
+    template <typename Gen>
+    struct gen_store : gen_store_interface {
+        using gen_type = Gen;
+        using _MyType = gen_store<gen_type>;
+        template <typename GenArg>
+        gen_store(GenArg &&gen) : gen_(std::forward<GenArg>(gen)) {}
+
+        std::unique_ptr<gen_store_interface> clone() const override {
+            return std::unique_ptr<gen_store_interface>(new _MyType(gen_));
+        }
+        ~gen_store() override {}
+
+        const key_type &operator*() const override { return gen_.operator*(); }
+        const key_type *operator->() const override { return gen_.operator->(); }
+        _MyType &operator++() override {
+            gen_.operator++();
+            return *this;
+        }
+        const key_type &seek_forward(const key_type &range) override { return gen_.seek_forward(range); }
+
+      private:
+        gen_type gen_;
+    };
+
+    // The wrapper only exposes the generator interface
+    const key_type &operator*() const { return store_->operator*(); }
+    const key_type *operator->() const { return store_->operator->(); }
+    range_gen_wrapper &operator++() {
+        store_->operator++();
+        return *this;
+    }
+    const key_type &seek_forward(const key_type &range) { return store_->seek_forward(range); }
+
+    // We don't want to deal with empty wrappers, so we just won't allow them
+    range_gen_wrapper() = delete;
+
+    template <typename RangeGen>
+    range_gen_wrapper(RangeGen &&gen) : store_(new gen_store<RangeGen>(std::forward<RangeGen>(gen))) {}
+    range_gen_wrapper(const range_gen_wrapper &other) : store_() {
+        assert(other.store_);
+        if (other.store_) {
+            store_ = other.store_->clone();
+        }
+    }
+    range_gen_wrapper &operator=(const range_gen_wrapper &other) {
+        assert(other.store_);
+        if (other.store_) {
+            store_ = other.store_->clone();
+        }
+    }
+
+  private:
+    std::unique_ptr<gen_store_interface> store_;
 };
 
 }  // namespace sparse_container

@@ -361,10 +361,10 @@ std::shared_ptr<QueueBatchContext> QueueBatchContext::ResolveOneWaitSemaphore(Vk
         if (signal_scope.queue == wait_scope.queue) {
             // If signal queue == wait queue, signal is treated as a memory barrier with an access scope equal to the
             // valid accesses for the sync scope.
-            access_context_.ResolveFromContext(sem_same_queue_op, from_context, range_gen);
+            access_context_.ResolveFromContext(sem_same_queue_op, range_gen, from_context);
             access_context_.ResolveFromContext(noop_barrier_op, from_context);
         } else {
-            access_context_.ResolveFromContext(sem_not_same_queue_op, from_context, range_gen);
+            access_context_.ResolveFromContext(sem_not_same_queue_op, range_gen, from_context);
             access_context_.ResolveFromContext(noop_sem_op, from_context);
         }
     }
@@ -391,7 +391,7 @@ std::shared_ptr<QueueBatchContext> QueueBatchContext::ResolveOneWaitSemaphore(Vk
     if (signal_state->acquired.image) {
         // Import the *presenting* batch, but replacing presenting with acquired.
         ApplyAcquireNextSemaphoreAction apply_acq(wait_scope, signal_state->acquired.acquire_tag);
-        access_context_.ResolveFromContext(apply_acq, from_context, signal_state->acquired.generator);
+        access_context_.ResolveFromContext(apply_acq, signal_state->acquired.generator, from_context);
 
         // Grab the reset of the presenting QBC, with no effective barrier, won't overwrite the acquire, as the tag is newer
         SyncBarrier noop_barrier;
