@@ -276,64 +276,6 @@ HazardResult ResourceAccessState::DetectBarrierHazard(const SyncStageAccessInfoT
     return hazard;
 }
 
-HazardResult ResourceAccessState::DetectBarrierHazard(const SyncStageAccessInfoType &usage_info,
-                                                      const ResourceAccessState &scope_state,
-                                                      VkPipelineStageFlags2KHR src_exec_scope,
-                                                      const SyncStageAccessFlags &src_access_scope, QueueId event_queue,
-                                                      ResourceUsageTag event_tag) const {
-    // Only supporting image layout transitions for now
-    assert(usage_info.stage_access_index == SyncStageAccessIndex::SYNC_IMAGE_LAYOUT_TRANSITION);
-    HazardResult hazard;
-
-    if (last_write.has_value() && (last_write->tag_ >= event_tag)) {
-        // Any write after the event precludes the possibility of being in the first access scope for the layout transition
-        hazard.Set(this, usage_info, WRITE_AFTER_WRITE, *last_write);
-    } else {
-        // only test for WAW if there no intervening read operations.
-        // See DetectHazard(SyncStagetAccessIndex) above for more details.
-        if (last_reads.size()) {
-            // Look at the reads if any... if reads exist, they are either the reason the access is in the event
-            // first scope, or they are a hazard.
-            const ReadStates &scope_reads = scope_state.last_reads;
-            const ReadStates::size_type scope_read_count = scope_reads.size();
-            // Since the hasn't been a write:
-            //  * The current read state is a superset of the scoped one
-            //  * The stage order is the same.
-            assert(last_reads.size() >= scope_read_count);
-            for (ReadStates::size_type read_idx = 0; read_idx < scope_read_count; ++read_idx) {
-                const ReadState &scope_read = scope_reads[read_idx];
-                const ReadState &current_read = last_reads[read_idx];
-                assert(scope_read.stage == current_read.stage);
-                if (current_read.tag > event_tag) {
-                    // The read is more recent than the set event scope, thus no barrier from the wait/ILT.
-                    hazard.Set(this, usage_info, WRITE_AFTER_READ, current_read.access, current_read.tag);
-                } else {
-                    // The read is in the events first synchronization scope, so we use a barrier hazard check
-                    // If the read stage is not in the src sync scope
-                    // *AND* not execution chained with an existing sync barrier (that's the or)
-                    // then the barrier access is unsafe (R/W after R)
-                    if (scope_read.IsReadBarrierHazard(event_queue, src_exec_scope)) {
-                        hazard.Set(this, usage_info, WRITE_AFTER_READ, scope_read.access, scope_read.tag);
-                        break;
-                    }
-                }
-            }
-            if (!hazard.IsHazard() && (last_reads.size() > scope_read_count)) {
-                const ReadState &current_read = last_reads[scope_read_count];
-                hazard.Set(this, usage_info, WRITE_AFTER_READ, current_read.access, current_read.tag);
-            }
-        } else if (last_write.has_value()) {
-            // if there are no reads, the write is either the reason the access is in the event scope... they are a hazard
-            // The write is in the first sync scope of the event (sync their aren't any reads to be the reason)
-            // So do a normal barrier hazard check
-            if (scope_state.IsWriteBarrierHazard(event_queue, src_exec_scope, src_access_scope)) {
-                hazard.Set(&scope_state, usage_info, WRITE_AFTER_WRITE, *scope_state.last_write);
-            }
-        }
-    }
-
-    return hazard;
-}
 void ResourceAccessState::MergePending(const ResourceAccessState &other) {
     pending_layout_transition |= other.pending_layout_transition;
 }

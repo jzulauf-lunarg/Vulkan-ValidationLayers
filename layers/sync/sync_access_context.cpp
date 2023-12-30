@@ -26,9 +26,9 @@ class HazardDetector {
     const SyncStageAccessInfoType &usage_info_;
 
   public:
-    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const { return value.second.DetectHazard(usage_info_); }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
-        return value.second.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult Detect(const ResourceAccessState &state) const { return state.DetectHazard(usage_info_); }
+    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
+        return state.DetectAsyncHazard(usage_info_, start_tag);
     }
     explicit HazardDetector(SyncStageAccessIndex usage_index) : usage_info_(SyncStageAccess::UsageInfo(usage_index)) {}
 };
@@ -38,11 +38,11 @@ class HazardDetectorWithOrdering {
     const SyncOrdering ordering_rule_;
 
   public:
-    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
-        return value.second.DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
+    HazardResult Detect(const ResourceAccessState &state) const {
+        return state.DetectHazard(usage_info_, ordering_rule_, kQueueIdInvalid);
     }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
-        return value.second.DetectAsyncHazard(usage_info_, start_tag);
+    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
+        return state.DetectAsyncHazard(usage_info_, start_tag);
     }
     HazardDetectorWithOrdering(SyncStageAccessIndex usage_index, SyncOrdering ordering)
         : usage_info_(SyncStageAccess::UsageInfo(usage_index)), ordering_rule_(ordering) {}
@@ -52,11 +52,9 @@ class HazardDetectFirstUse {
   public:
     HazardDetectFirstUse(const ResourceAccessState &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range)
         : recorded_use_(recorded_use), queue_id_(queue_id), tag_range_(tag_range) {}
-    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
-        return value.second.DetectHazard(recorded_use_, queue_id_, tag_range_);
-    }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
-        return value.second.DetectAsyncHazard(recorded_use_, tag_range_, start_tag);
+    HazardResult Detect(const ResourceAccessState &state) const { return state.DetectHazard(recorded_use_, queue_id_, tag_range_); }
+    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
+        return state.DetectAsyncHazard(recorded_use_, tag_range_, start_tag);
     }
 
   private:
@@ -338,12 +336,12 @@ class BarrierHazardDetector {
           src_exec_scope_(src_exec_scope),
           src_access_scope_(src_access_scope) {}
 
-    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) const {
-        return value.second.DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
+    HazardResult Detect(const ResourceAccessState &state) const {
+        return state.DetectBarrierHazard(usage_info_, kQueueIdInvalid, src_exec_scope_, src_access_scope_);
     }
-    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return value.second.DetectAsyncHazard(usage_info_, start_tag);
+        return state.DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
@@ -352,99 +350,49 @@ class BarrierHazardDetector {
     SyncStageAccessFlags src_access_scope_;
 };
 
-class EventBarrierHazardDetector {
+// Use the Detect path for accesses in scope, use Async path for accesses outside of scope
+// this isn't quite right, as we need to track the sync tag of out-of-queue accesses, so there's
+// some false negatives with this approach
+class EventScopeBarrierHazardDetector {
   public:
-    EventBarrierHazardDetector(SyncStageAccessIndex usage_index, VkPipelineStageFlags2KHR src_exec_scope,
-                               SyncStageAccessFlags src_access_scope, const AccessContext::ScopeMap &event_scope, QueueId queue_id,
-                               ResourceUsageTag scope_tag)
+    EventScopeBarrierHazardDetector(SyncStageAccessIndex usage_index, VkPipelineStageFlags2KHR src_exec_scope,
+                                    SyncStageAccessFlags src_access_scope, QueueId queue_id, ResourceUsageTag scope_tag)
         : usage_info_(SyncStageAccess::UsageInfo(usage_index)),
           src_exec_scope_(src_exec_scope),
           src_access_scope_(src_access_scope),
-          event_scope_(event_scope),
-          scope_queue_id_(queue_id),
-          scope_tag_(scope_tag),
-          scope_pos_(event_scope.cbegin()),
-          scope_end_(event_scope.cend()) {}
+          queue_id_(queue_id) {}
 
-    HazardResult Detect(const ResourceAccessRangeMap::value_type &value) {
-        // Need to piece together coverage of pos->first range:
-        // Copy the range as we'll be chopping it up as needed
-        ResourceAccessRange range = value.first;  // Intentional copy
-        const ResourceAccessState &access = value.second;
-        HazardResult hazard;
-
-        bool in_scope = AdvanceScope(range);
-        bool unscoped_tested = false;
-        while (in_scope && !hazard.IsHazard()) {
-            if (range.begin < ScopeBegin()) {
-                if (!unscoped_tested) {
-                    unscoped_tested = true;
-                    hazard = access.DetectHazard(usage_info_);
-                }
-                // Note: don't need to check for in_scope as AdvanceScope true means range and ScopeRange intersect.
-                // Thus a [ ScopeBegin, range.end ) will be non-empty.
-                range.begin = ScopeBegin();
-            } else {  // in_scope implied that ScopeRange and range intersect
-                hazard = access.DetectBarrierHazard(usage_info_, ScopeState(), src_exec_scope_, src_access_scope_, scope_queue_id_,
-                                                    scope_tag_);
-                if (!hazard.IsHazard()) {
-                    range.begin = ScopeEnd();
-                    in_scope = AdvanceScope(range);  // contains a non_empty check
-                }
-            }
-        }
-        if (range.non_empty() && !hazard.IsHazard() && !unscoped_tested) {
-            hazard = access.DetectHazard(usage_info_);
-        }
-        return hazard;
+    HazardResult Detect(const ResourceAccessState &state) {
+        return state.DetectBarrierHazard(usage_info_, queue_id_, src_exec_scope_, src_access_scope_);
     }
-
-    HazardResult DetectAsync(const ResourceAccessRangeMap::value_type &value, ResourceUsageTag start_tag) const {
+    HazardResult DetectAsync(const ResourceAccessState &state, ResourceUsageTag start_tag) const {
         // Async barrier hazard detection can use the same path as the usage index is not IsRead, but is IsWrite
-        return value.second.DetectAsyncHazard(usage_info_, start_tag);
+        return state.DetectAsyncHazard(usage_info_, start_tag);
     }
 
   private:
-    bool ScopeInvalid() const { return scope_pos_ == scope_end_; }
-    bool ScopeValid() const { return !ScopeInvalid(); }
-    void ScopeSeek(const ResourceAccessRange &range) { scope_pos_ = event_scope_.lower_bound(range); }
-
-    // Hiding away the std::pair grunge...
-    ResourceAddress ScopeBegin() const { return scope_pos_->first.begin; }
-    ResourceAddress ScopeEnd() const { return scope_pos_->first.end; }
-    const ResourceAccessRange &ScopeRange() const { return scope_pos_->first; }
-    const ResourceAccessState &ScopeState() const { return scope_pos_->second; }
-
-    bool AdvanceScope(const ResourceAccessRange &range) {
-        // Note: non_empty is (valid && !empty), so don't change !non_empty to empty...
-        if (!range.non_empty()) return false;
-        if (ScopeInvalid()) return false;
-
-        if (ScopeRange().strictly_less(range)) {
-            ScopeSeek(range);
-        }
-
-        return ScopeValid() && ScopeRange().intersects(range);
-    }
-
     const SyncStageAccessInfoType usage_info_;
     VkPipelineStageFlags2KHR src_exec_scope_;
     SyncStageAccessFlags src_access_scope_;
-    const AccessContext::ScopeMap &event_scope_;
-    QueueId scope_queue_id_;
-    const ResourceUsageTag scope_tag_;
-    AccessContext::ScopeMap::const_iterator scope_pos_;
-    AccessContext::ScopeMap::const_iterator scope_end_;
+    QueueId queue_id_;
 };
 
 HazardResult AccessContext::DetectImageBarrierHazard(const ImageState &image, const VkImageSubresourceRange &subresource_range,
                                                      VkPipelineStageFlags2KHR src_exec_scope,
                                                      const SyncStageAccessFlags &src_access_scope, QueueId queue_id,
-                                                     const ScopeMap &scope_map, const ResourceUsageTag scope_tag,
+                                                     const AccessContext &first_scope, const ResourceUsageTag scope_tag,
                                                      AccessContext::DetectOptions options) const {
-    EventBarrierHazardDetector detector(SyncStageAccessIndex::SYNC_IMAGE_LAYOUT_TRANSITION, src_exec_scope, src_access_scope,
-                                        scope_map, queue_id, scope_tag);
-    return DetectHazard(detector, image, subresource_range, false, options);
+    ImageRangeGen image_range_gen = image.MakeImageRangeGen(subresource_range, false);
+
+    sparse_container::intersection_generator in_scope_gen(image_range_gen, MapRangeGen(first_scope.access_state_map_));
+    EventScopeBarrierHazardDetector detector(SyncStageAccessIndex::SYNC_IMAGE_LAYOUT_TRANSITION, src_exec_scope, src_access_scope,
+                                             queue_id, scope_tag);
+    HazardResult hazard = first_scope.DetectHazardGeneratedRanges(detector, in_scope_gen, options);
+    if (!hazard.IsHazard()) {
+        sparse_container::intersection_generator out_scope_gen(image_range_gen, MapRangeGen(access_state_map_));
+        hazard = DetectAsyncHazard(detector, out_scope_gen, scope_tag);
+    }
+    return hazard;
 }
 
 HazardResult AccessContext::DetectImageBarrierHazard(const AttachmentViewGen &view_gen, const SyncBarrier &barrier,
@@ -588,7 +536,7 @@ HazardResult AccessContext::DetectAsyncHazard(const Detector &detector, const Ra
     sparse_container::intersection_generator range_gen(const_range_gen, MapRangeGen(access_state_map_),
                                                        IntersectionAdvanceSecond());
     for (; range_gen->non_empty(); ++range_gen) {
-        hazard = detector.DetectAsync(*range_gen.get_second_gen().get_pos(), async_tag);
+        hazard = detector.DetectAsync(range_gen.get_second_gen().get_pos()->second, async_tag);
         if (hazard.IsHazard()) break;
     }
 
@@ -614,7 +562,7 @@ HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, Rang
     sparse_container::mapped_range_generator map_gen(access_state_map_);
     sparse_container::intersection_generator hazard_gen(range_gen, map_gen);
     for (; !hazard_gen->empty(); ++hazard_gen) {
-        hazard = detector.Detect(*hazard_gen.get_second_gen().get_pos());
+        hazard = detector.Detect(hazard_gen.get_second_gen().get_pos()->second);
         if (hazard.IsHazard()) return hazard;
     }
 
@@ -625,7 +573,7 @@ HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, Rang
         sparse_container::intersection_generator prev_gen(range_gen, gap_gen);
         auto prev_access_map = ResolvePreviousAccessRangeGen(prev_gen, nullptr, nullptr);
         for (const auto &prev : prev_access_map) {
-            hazard = detector.Detect(prev);
+            hazard = detector.Detect(prev.second);
             if (hazard.IsHazard()) return hazard;
         }
     }

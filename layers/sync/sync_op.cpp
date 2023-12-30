@@ -52,7 +52,7 @@ class MapRangesRangeGenerator {
     using IntersectionGen = sparse_container::intersection_generator<MapGen, RangeGen>;
     IntersectionGen gen_;
 };
-using EventSimpleRangeGenerator = MapRangesRangeGenerator<AccessContext::ScopeMap>;
+using EventSimpleRangeGenerator = MapRangesRangeGenerator<ResourceAccessRangeMap>;
 
 // Generate the ranges that are the intersection of the RangeGen ranges and the entries in the FilterMap
 // Templated to allow for different Range generators or map sources...
@@ -74,7 +74,7 @@ class FilteredGeneratorGenerator {
     IntersectionGen gen_;
 };
 
-using EventImageRangeGenerator = FilteredGeneratorGenerator<AccessContext::ScopeMap, subresource_adapter::ImageRangeGenerator>;
+using EventImageRangeGenerator = FilteredGeneratorGenerator<ResourceAccessRangeMap, subresource_adapter::ImageRangeGenerator>;
 
 SyncOpBarriers::SyncOpBarriers(vvl::Func command, const SyncValidator &sync_state, VkQueueFlags queue_flags,
                                VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
@@ -502,7 +502,7 @@ bool SyncOpWaitEvents::DoValidate(const CommandExecutionContext &exec_context, c
                 default:
                     assert(ignore_reason == SyncEventState::NotIgnored);
             }
-        } else if (barrier_set.image_memory_barriers.size()) {
+        } else if (barrier_set.image_memory_barriers.size() && sync_event->first_scope) {
             const auto &image_memory_barriers = barrier_set.image_memory_barriers;
             const auto *context = exec_context.GetCurrentAccessContext();
             assert(context);
@@ -584,16 +584,18 @@ struct SyncOpWaitEventsFunctorFactory {
     BufferRange MakeRangeGen(const vvl::Buffer &buffer, const ResourceAccessRange &range_arg) const {
         const auto base_address = ResourceBaseAddress(buffer);
         ResourceAccessRange range = SimpleBinding(buffer) ? (range_arg + base_address) : ResourceAccessRange();
-        EventSimpleRangeGenerator filtered_range_gen(sync_event->FirstScope(), range);
+        EventSimpleRangeGenerator filtered_range_gen(sync_event->FirstScope().GetAccessStateMap(), range);
         return filtered_range_gen;
     }
     ImageRange MakeRangeGen(const ImageState &image, const VkImageSubresourceRange &subresource_range) const {
         ImageRangeGen image_range_gen = image.MakeImageRangeGen(subresource_range, false);
-        EventImageRangeGenerator filtered_range_gen(sync_event->FirstScope(), image_range_gen);
+        EventImageRangeGenerator filtered_range_gen(sync_event->FirstScope().GetAccessStateMap(), image_range_gen);
 
         return filtered_range_gen;
     }
-    GlobalRange MakeGlobalRangeGen() const { return EventSimpleRangeGenerator(sync_event->FirstScope(), kFullRange); }
+    GlobalRange MakeGlobalRangeGen() const {
+        return EventSimpleRangeGenerator(sync_event->FirstScope().GetAccessStateMap(), kFullRange);
+    }
     SyncOpWaitEventsFunctorFactory(SyncEventState *sync_event_) : sync_event(sync_event_) { assert(sync_event); }
     SyncEventState *sync_event;
 };
@@ -751,13 +753,7 @@ SyncOpSetEvent::SyncOpSetEvent(vvl::Func command, const SyncValidator &sync_stat
       recorded_context_(),
       src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, stageMask)),
       dep_info_() {
-    // Snapshot the current access_context for later inspection at wait time.
-    // NOTE: This appears brute force, but given that we only save a "first-last" model of access history, the current
-    //       access context (include barrier state for chaining) won't necessarily contain the needed information at Wait
-    //       or Submit time reference.
-    if (access_context) {
-        recorded_context_ = std::make_shared<const AccessContext>(*access_context);
-    }
+    InitRecordedContext(access_context);
 }
 
 SyncOpSetEvent::SyncOpSetEvent(vvl::Func command, const SyncValidator &sync_state, VkQueueFlags queue_flags, VkEvent event,
@@ -767,8 +763,19 @@ SyncOpSetEvent::SyncOpSetEvent(vvl::Func command, const SyncValidator &sync_stat
       recorded_context_(),
       src_exec_scope_(SyncExecScope::MakeSrc(queue_flags, sync_utils::GetGlobalStageMasks(dep_info).src)),
       dep_info_(new safe_VkDependencyInfo(&dep_info)) {
+    InitRecordedContext(access_context);
+}
+
+void SyncOpSetEvent::InitRecordedContext(const AccessContext *access_context) {
     if (access_context) {
-        recorded_context_ = std::make_shared<const AccessContext>(*access_context);
+        // Snapshot the current access_context for later inspection at wait time.
+        // NOTE: This appears brute force, but given that we only save a "first-last" model of access history, the current
+        //       access context (include barrier state for chaining) won't necessarily contain the needed information at Wait
+        //       or Submit time reference.
+        auto scope_context = std::make_shared<AccessContext>(*access_context);
+        // Get the full history for future hazard checks
+        scope_context->ResolvePreviousAccesses();
+        recorded_context_ = std::move(scope_context);
     }
 }
 

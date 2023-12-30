@@ -215,7 +215,6 @@ class AccessContext {
   public:
     using ImageState = syncval_state::ImageState;
     using ImageViewState = syncval_state::ImageViewState;
-    using ScopeMap = ResourceAccessRangeMap;
     enum DetectOptions : uint32_t {
         kDetectPrevious = 1U << 0,
         kDetectAsync = 1U << 1,
@@ -240,7 +239,7 @@ class AccessContext {
 
     HazardResult DetectImageBarrierHazard(const ImageState &image, const VkImageSubresourceRange &subresource_range,
                                           VkPipelineStageFlags2KHR src_exec_scope, const SyncStageAccessFlags &src_access_scope,
-                                          QueueId queue_id, const ScopeMap &scope_map, ResourceUsageTag scope_tag,
+                                          QueueId queue_id, const AccessContext &first_scope, ResourceUsageTag scope_tag,
                                           DetectOptions options) const;
     HazardResult DetectImageBarrierHazard(const AttachmentViewGen &attachment_view, const SyncBarrier &barrier,
                                           DetectOptions options) const;

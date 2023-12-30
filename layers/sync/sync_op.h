@@ -60,7 +60,10 @@ struct SyncEventState {
     }
 
     void ResetFirstScope();
-    const AccessContext::ScopeMap &FirstScope() const { return first_scope->GetAccessStateMap(); }
+    const AccessContext &FirstScope() const {
+        assert(first_scope);
+        return *first_scope;
+    }
     IgnoreReason IsIgnoredByWait(vvl::Func command, VkPipelineStageFlags2KHR srcStageMask) const;
     bool HasBarrier(VkPipelineStageFlags2KHR stageMask, VkPipelineStageFlags2KHR exec_scope) const;
     void AddReferencedTags(ResourceUsageTagSet &referenced) const;
@@ -271,6 +274,7 @@ class SyncOpSetEvent : public SyncOpBase {
     bool DoValidate(const CommandExecutionContext &ex_context, const ResourceUsageTag base_tag) const;
     void DoRecord(QueueId queue_id, ResourceUsageTag recorded_tag, const std::shared_ptr<const AccessContext> &access_context,
                   SyncEventsContext *events_context) const;
+    void InitRecordedContext(const AccessContext *access_context);
     std::shared_ptr<const vvl::Event> event_;
     // The Access context of the command buffer at record set event time.
     std::shared_ptr<const AccessContext> recorded_context_;
