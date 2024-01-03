@@ -2120,7 +2120,7 @@ class mapped_gap_generator {
 
     // Note, just because you've got access to an iterator, doesn't mean it's safe to change the underlying map.
     // points to the map position *after* the current gap
-    const iterator &get_pos() { return pos_; };
+    const iterator &get_pos() const { return pos_; };
 
   private:
     // Always returns a gap.end = lb.begin (suitable for "seek_next_gap" below)

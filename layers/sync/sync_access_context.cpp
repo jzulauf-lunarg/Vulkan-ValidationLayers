@@ -587,23 +587,41 @@ ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeG
     if (prev_.size() == 0) {
         return InfillRangeGen(gen_arg, previous_barrier, infill_state);
     } else {
-        std::vector<ResourceAccessRangeMap> previous;
-        previous.reserve(prev_.size());
         // Look for something to fill the gap further along.
-        for (const auto &prev_dep : prev_) {
+        const bool single_previous = prev_.size() == 1;
+        const ResourceAccessState *recur_infill = single_previous ? infill_state : nullptr;
+        auto recur_prev = [this, &gen_arg, recur_infill, previous_barrier](const TrackBack &prev_dep) {
             const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
             sparse_container::intersection_generator prev_gen(sparse_container::mapped_gap_generator(access_state_map_), gen_arg);
-            previous.emplace_back(prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, infill_state, true));
+            return prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, recur_infill, true);
+        };
+
+        // To get RVO -- need to return an auto scope variable -- so we treat the first one specially
+        ResourceAccessRangeMap resolved(recur_prev(prev_[0]));
+
+        if (single_previous) {
+            // Nothing to reduce with... thus, done.
+            return resolved;
         }
 
-        // Log2 N reduction of the previous (if more than one)
-        // Use a stack variable to allow RCE to run, not sure that REC could would with an entry of a std::vector
-        ResourceAccessRangeMap resolved;
+        // Otherwise we need to build a reducible array of prev to resolve.
         std::vector<ResourceAccessRangeMap *> resolve_maps;
-        resolve_maps.reserve(previous.size() + 1);
-        resolve_maps.push_back(&resolved);
-        for (auto &prev_map : previous) {
-            resolve_maps.push_back(&prev_map);
+        resolve_maps.reserve(prev_.size());
+
+        std::vector<ResourceAccessRangeMap> previous;
+        previous.reserve(prev_.size() - 1);
+
+        // This the general case
+        for (const auto &prev_dep : prev_) {
+            if (resolve_maps.empty()) {
+                // Treating the 0'th entry as special
+                resolve_maps.push_back(&resolved);
+            } else {
+                // Since previous is has a capacity of prev_.size() -1, references stored in resolve_maps are not invalidated.
+                assert(previous.size() < previous.capacity());
+                previous.emplace_back(recur_prev(prev_dep));
+                resolve_maps.push_back(&previous.back());
+            }
         }
 
         while (resolve_maps.size() > 1) {
@@ -619,6 +637,14 @@ ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeG
         }
         assert(resolve_maps.size() == 1);
         assert(resolve_maps[0] == &resolved);
+        if (infill_state) {
+            // Need to gap fill, because we suppressed it in the recurrent calls to avoid tree clutter.
+            sparse_container::mapped_gap_generator gap_gen(resolved);
+            sparse_container::intersection_generator infill_gen(gen_arg, gap_gen);
+            for (; infill_gen->non_empty(); ++infill_gen) {
+                resolved.insert(infill_gen.get_second_gen().get_pos(), std::make_pair(*infill_gen, *infill_state));
+            }
+        }
         return resolved;
     }
 }
