@@ -473,7 +473,7 @@ void RenderPassAccessContext::RecordLayoutTransitions(const vvl::RenderPass &rp_
     // If there were no transitions skip this global map walk
     if (transitions.size()) {
         ResolvePendingBarrierFunctor apply_pending_action(tag);
-        access_context.ApplyToContext(apply_pending_action);
+        access_context.ApplyToContext(apply_pending_action, apply_pending_action.UpdateOptions());
     }
 }
 

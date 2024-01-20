@@ -264,6 +264,14 @@ class ResourceAccessState : public SyncStageAccess {
     using FirstAccesses = small_vector<ResourceFirstAccess, 3>;
 
   public:
+    // KILl KILL KILL WIP WIP WIP
+    template <typename Transform>
+    ResourceAccessState Transformed(Transform &transform_op) const {
+        ResourceAccessState transformed_copy(*this);
+        transform_op(transformed_copy);
+        return transformed_copy;
+    }
+
     // Mutliple read operations can be simlutaneously (and independently) synchronized,
     // given the only the second execution scope creates a dependency chain, we have to track each,
     // but only up to one per pipeline stage (as another read from the *same* stage become more recent,
@@ -338,7 +346,7 @@ class ResourceAccessState : public SyncStageAccess {
     void ClearRead();
     void ClearPending();
     void ClearFirstUse();
-    void Resolve(const ResourceAccessState &other);
+
     void ApplyBarriers(const std::vector<SyncBarrier> &barriers, bool layout_transition);
     void ApplyBarriersImmediate(const std::vector<SyncBarrier> &barriers);
     template <typename ScopeOps>
@@ -370,15 +378,24 @@ class ResourceAccessState : public SyncStageAccess {
     friend WaitAcquirePredicate;
 
     template <typename Predicate>
-    bool ApplyPredicatedWait(Predicate &predicate);
+    bool ApplyPredicatedWait(const Predicate &predicate);
 
     bool FirstAccessInTagRange(const ResourceUsageRange &tag_range) const;
 
     void OffsetTag(ResourceUsageTag offset);
     ResourceAccessState();
+    ResourceAccessState(const ResourceAccessState &) = default;
+
+    template <typename Transform>
+    ResourceAccessState(const ResourceAccessState &other, const Transform &transform) : ResourceAccessState(other) {
+        transform(*this);
+    }
+
+    ResourceAccessState &operator=(const ResourceAccessState &) = default;
 
     bool HasPendingState() const { return (0 != pending_layout_transition) || (last_write && last_write->HasPendingState()); }
     bool HasWriteOp() const { return last_write.has_value(); }
+    bool LastReadWriteEmpty() const { return !last_write.has_value() && last_read_stages == 0; }
     SyncStageAccessIndex LastWriteOp() const { return last_write.has_value() ? last_write->Index() : SYNC_ACCESS_INDEX_NONE; }
     bool IsLastWriteOp(SyncStageAccessIndex usage_index) const { return LastWriteOp() == usage_index; }
     ResourceUsageTag LastWriteTag() const { return last_write.has_value() ? last_write->Tag() : ResourceUsageTag(0); }
@@ -444,6 +461,9 @@ class ResourceAccessState : public SyncStageAccess {
     void Normalize();
     void GatherReferencedTags(ResourceUsageTagSet &used) const;
 
+    void ResolveRead(const ResourceAccessState &other);
+    void ResolveReadWrite(const ResourceAccessState &other);
+
   private:
     static constexpr VkPipelineStageFlags2KHR kInvalidAttachmentStage = ~VkPipelineStageFlags2KHR(0);
     bool IsRAWHazard(const SyncStageAccessInfoType &usage_info) const;
@@ -466,8 +486,10 @@ class ResourceAccessState : public SyncStageAccess {
 
     void UpdateFirst(ResourceUsageTag tag, const SyncStageAccessInfoType &usage_info, SyncOrdering ordering_rule);
     void TouchupFirstForLayoutTransition(ResourceUsageTag tag, const OrderingBarrier &layout_ordering);
+
     void MergePending(const ResourceAccessState &other);
     void MergeReads(const ResourceAccessState &other);
+    void MergeFirstUse(const ResourceAccessState &other);
 
     static const OrderingBarrier &GetOrderingRules(SyncOrdering ordering_enum) {
         return kOrderingRules[static_cast<size_t>(ordering_enum)];
@@ -503,6 +525,8 @@ class ResourceAccessState : public SyncStageAccess {
 
     static OrderingBarriers kOrderingRules;
 };
+
+using ResourceAccessStateFunction = std::function<void(ResourceAccessState &)>;
 
 // Apply the memory barrier without updating the existing barriers.  The execution barrier
 // changes the "chaining" state, but to keep barriers independent, we defer this until all barriers
@@ -557,7 +581,7 @@ void ResourceAccessState::ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barr
 
 // Return if the resulting state is "empty"
 template <typename Predicate>
-bool ResourceAccessState::ApplyPredicatedWait(Predicate &predicate) {
+bool ResourceAccessState::ApplyPredicatedWait(const Predicate &predicate) {
     VkPipelineStageFlags2KHR sync_reads = VK_PIPELINE_STAGE_2_NONE;
 
     // Use the predicate to build a mask of the read stages we are synchronizing

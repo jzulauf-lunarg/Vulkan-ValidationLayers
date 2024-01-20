@@ -349,14 +349,14 @@ struct PipelineBarrierOp {
     PipelineBarrierOp(const PipelineBarrierOp &rhs)
         : barrier(rhs.barrier), layout_transition(rhs.layout_transition), scope(rhs.scope) {}
 
-    void operator()(ResourceAccessState *access_state) const { access_state->ApplyBarrier(scope, barrier, layout_transition); }
+    void operator()(ResourceAccessState &access_state) const { access_state.ApplyBarrier(scope, barrier, layout_transition); }
 };
 
 // Batch barrier ops don't modify in place, and thus don't need to hold pending state, and also are *never* layout transitions.
 struct BatchBarrierOp : public PipelineBarrierOp {
-    void operator()(ResourceAccessState *access_state) const {
-        access_state->ApplyBarrier(scope, barrier, layout_transition);
-        access_state->ApplyPendingBarriers(kInvalidTag);  // There can't be any need for this tag
+    void operator()(ResourceAccessState &access_state) const {
+        access_state.ApplyBarrier(scope, barrier, layout_transition);
+        access_state.ApplyPendingBarriers(kInvalidTag);  // There can't be any need for this tag
     }
     BatchBarrierOp(QueueId queue_id, const SyncBarrier &barrier_) : PipelineBarrierOp(queue_id, barrier_, false) {}
 };
@@ -375,7 +375,7 @@ struct WaitEventBarrierOp {
             layout_transition = false;
         }
     }
-    void operator()(ResourceAccessState *access_state) const { access_state->ApplyBarrier(scope_ops, barrier, layout_transition); }
+    void operator()(ResourceAccessState &access_state) const { access_state.ApplyBarrier(scope_ops, barrier, layout_transition); }
 };
 
 // Allow keep track of the exec contexts replay state

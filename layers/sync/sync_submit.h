@@ -286,8 +286,6 @@ class QueueBatchContext : public CommandExecutionContext {
 
     VulkanTypedHandle Handle() const override;
 
-    template <typename Predicate>
-    void ApplyPredicatedWait(Predicate &predicate);
     void ApplyTaggedWait(QueueId queue_id, ResourceUsageTag tag);
     void ApplyAcquireWait(const AcquiredImage &acquired);
 

@@ -1598,7 +1598,7 @@ class cached_lower_bound_impl {
     // Default constructed object reports valid (correctly) as false, but otherwise will fail (assert) under nearly any use.
     cached_lower_bound_impl()
         : map_(nullptr), end_(), pos_(index_, lower_bound_, valid_), index_(0), lower_bound_(), valid_(false) {}
-    cached_lower_bound_impl(Map &map, const index_type &index)
+    cached_lower_bound_impl(Map &map, const index_type &index = std::numeric_limits<index_type>::min())
         : map_(&map),
           end_(map.end()),
           pos_(index_, lower_bound_, valid_),
@@ -2358,8 +2358,9 @@ class range_gen_wrapper {
 
     template <typename Gen>
     struct gen_store : gen_store_interface {
-        using gen_type = Gen;
-        using _MyType = gen_store<gen_type>;
+        using non_const_gen_type = typename std::remove_const<Gen>::type;
+        using gen_type = typename std::decay<Gen>::type;
+        using _MyType = gen_store<Gen>;
         template <typename GenArg>
         gen_store(GenArg &&gen) : gen_(std::forward<GenArg>(gen)) {}
 
@@ -2410,5 +2411,37 @@ class range_gen_wrapper {
   private:
     std::unique_ptr<gen_store_interface> store_;
 };
+
+enum class assign_type { copy, move };
+
+struct assign_policy_copy {
+    constexpr static assign_type value = assign_type::copy;
+};
+
+struct assign_policy_move {
+    constexpr static assign_type value = assign_type::move;
+};
+
+template <typename DstRangeMap, typename SourceIterator, typename AssignPolicy>
+void merge_non_intersecting(DstRangeMap &dst_map, const SourceIterator &begin, const SourceIterator &end, const AssignPolicy &) {
+    cached_lower_bound_impl dst_pos(dst_map);
+    SourceIterator src_pos = begin;
+    while (src_pos != end) {
+        if (!dst_pos.at_end() && dst_pos->lower_bound->first.begin < src_pos->first.end) {
+            // The requirement is that source and destination are non intersecting
+            assert(dst_pos->lower_bound->first.strictly_less(src_pos->first));
+            dst_pos.seek(src_pos->first.end);
+            //
+            assert(dst_pos.at_end() || src_pos->first.strictly_less(dst_pos->lower_bound->first));
+        }
+        if constexpr (AssignPolicy::value == assign_type::copy) {
+            dst_map.insert(dst_pos->lower_bound, *src_pos);
+        } else {
+            assert(AssignPolicy::value == assign_type::move);
+            dst_map.insert(dst_pos->lower_bound, std::make_pair(src_pos->first, std::move(src_pos->second)));
+        }
+        ++src_pos;
+    }
+}
 
 }  // namespace sparse_container

@@ -280,6 +280,37 @@ void ResourceAccessState::MergePending(const ResourceAccessState &other) {
     pending_layout_transition |= other.pending_layout_transition;
 }
 
+void ResourceAccessState::MergeFirstUse(const ResourceAccessState &other) {
+    if (!(first_accesses_ == other.first_accesses_) && !other.first_accesses_.empty()) {
+        FirstAccesses firsts(std::move(first_accesses_));
+        ClearFirstUse();
+        auto a = firsts.begin();
+        auto a_end = firsts.end();
+        for (auto &b : other.first_accesses_) {
+            // TODO: Determine whether some tag offset will be needed for PHASE II
+            while ((a != a_end) && (a->tag < b.tag)) {
+                UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
+                ++a;
+            }
+            UpdateFirst(b.tag, *b.usage_info, b.ordering_rule);
+        }
+        for (; a != a_end; ++a) {
+            UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
+        }
+    }
+}
+void ResourceAccessState::ResolveRead(const ResourceAccessState &other) {
+    MergePending(other);
+    MergeReads(other);
+    MergeFirstUse(other);
+}
+
+void ResourceAccessState::ResolveReadWrite(const ResourceAccessState &other) {
+    assert(other.last_write && last_write);
+    last_write->MergeBarriers(*other.last_write);
+    ResolveRead(other);
+}
+
 void ResourceAccessState::MergeReads(const ResourceAccessState &other) {
     // Merge the read states
     const auto pre_merge_count = last_reads.size();
@@ -330,6 +361,7 @@ void ResourceAccessState::MergeReads(const ResourceAccessState &other) {
     read_execution_barriers |= other.read_execution_barriers;
 }
 
+#if 0
 // The logic behind resolves is the same as update, we assume that earlier hazards have be reported, and that no
 // tranistive hazard can exists with a hazard between the earlier operations.  Yes, an early hazard can mask that another
 // exists, but if you fix *that* hazard it either fixes or unmasks the subsequent ones.
@@ -393,7 +425,46 @@ void ResourceAccessState::Resolve(const ResourceAccessState &other) {
             UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
         }
     }
+
 }
+#endif
+
+#if 0
+ResourceAccessState::ResolveOp ResourceAccessState::ComputeResolveOp(const ResourceAccessState &other) {
+    bool skip_first = false;
+    if (last_write.has_value()) {
+        if (other.last_write.has_value()) {
+            if (last_write->Tag() < other.last_write->Tag()) {
+                // NOTE: Both last and other have writes, and thus first access is "closed". We are selecting other's
+                //       first_access state, but it and this can only differ if there are async hazards
+                //       error state.
+                //
+                // If this is a later write, we've reported any exsiting hazard, and we can just overwrite as the more recent
+                // operation
+                return ResolveOp::TakeOther;
+            } else if (last_write->Tag() == other.last_write->Tag()) {
+                // In the *equals* case for write operations, we merged the write barriers and the read state (but without the
+                // dependency chaining logic or any stage expansion)
+                return ResolveOp::MergeReadWrite;
+            } else {
+                // other write is before this write... in which case we keep this instead of other
+                // and can skip the "first_access" merge, since first_access has been closed since other write tag or before
+                return ResolveOp::TakeThis;
+            }
+        } else {
+            // this has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
+            // Since this has a write first access is closed and shouldn't be updated by other
+            return ResolveOp::TakeThis;
+        }
+    } else if (other.last_write.has_value()) {  // && not this->last_write
+        // Other has write and this doesn't, thus keep it, See first access NOTE above
+        return ResolveOp::TakeOther;
+    } else {  // not this->last_write OR other.last_write
+        // Neither state has a write, just merge the reads
+        return ResolveOp::MergeReads;
+    }
+}
+#endif
 
 void ResourceAccessState::Update(const SyncStageAccessInfoType &usage_info, SyncOrdering ordering_rule,
                                  const ResourceUsageTag tag) {

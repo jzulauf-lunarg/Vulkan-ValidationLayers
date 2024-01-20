@@ -19,6 +19,8 @@
 #include "state_tracker/buffer_state.h"
 #include "sync/sync_access_context.h"
 
+std::atomic<AccessState::OpID> AccessState::OpContext::next_op_(0);
+
 bool SimpleBinding(const BINDABLE &bindable) { return !bindable.sparse && bindable.Binding(); }
 VkDeviceSize ResourceBaseAddress(const vvl::Buffer &buffer) { return buffer.GetFakeBaseAddress(); }
 
@@ -97,21 +99,87 @@ AccessContext::AccessContext(uint32_t subpass, VkQueueFlags queue_flags,
     }
 }
 
+// NOTE: If the maked_shared copies of other become a hotspot, we can implement a policy (template) parameter as to
+//       shallow or deep copies w.r.t. the AccessStates are in the same AccessContext list.
+//       That policy would be specified in the calling context based on whether the AccessStates being merged were
+//       created with insert_points in the same or different AccessContexts, but we don't want to store this on a per
+//       AccessState basis.
+//
+// The logic behind resolves is the same as update, we assume that earlier hazards have be reported, and that no
+// tranistive hazard can exists with a hazard between the earlier operations.  Yes, an early hazard can mask that another
+// exists, but if you fix *that* hazard it either fixes or unmasks the subsequent ones.
+AccessStateConstPtr AccessState::SSAResolve(const AccessStateConstPtr &other_access_state, const OpContext &op) const {
+    AccessStateConstPtr resolved;
+
+    // Set if we have resolved this before...
+    if (result_.op == op.Op()) {
+        resolved = result_.LookupResolve(other_access_state);
+        if (resolved) return resolved;
+    } else {
+        result_.InitResolve(op.Op());
+    }
+
+    const ResourceAccessState &other = other_access_state->GetState();
+    if (state_.HasWriteOp()) {
+        if (other.HasWriteOp()) {
+            const ResourceUsageTag this_write_tag = state_.LastWriteTag();
+            const ResourceUsageTag other_write_tag = other.LastWriteTag();
+            if (this_write_tag < other_write_tag) {
+                // NOTE: Both last and other have writes, and thus first access is "closed". We are selecting other's
+                //       first_access state, but it and this can only differ if there are async hazards
+                //       error state.
+                //
+                // If this is a later write, we've reported any exsiting hazard, and we can just overwrite as the more recent
+                // operation
+                resolved = std::make_shared<const AccessState>(other, op.InsertPoint());
+            } else if (this_write_tag == other_write_tag) {
+                // In the *equals* case for write operations, we merged the write barriers and the read state (but without the
+                // dependency chaining logic or any stage expansion)
+                auto merge_op = [&other](ResourceAccessState &state) { state.ResolveReadWrite(other); };
+                resolved = std::make_shared<const AccessState>(state_, op.InsertPoint(), merge_op);
+            } else {
+                // other write is before this write... in which case we keep this instead of other
+                // and can skip the "first_access" merge, since first_access has been closed since other write tag or before
+                // resolved <- default null value
+            }
+        } else {
+            // this has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
+            // Since this has a write first access is closed and shouldn't be updated by other
+            // resolved <- default null value
+        }
+    } else if (other.HasWriteOp()) {  // && not this->last_write
+        // Other has write and this doesn't, thus keep it, See first access NOTE above
+        resolved = std::make_shared<const AccessState>(other, op.InsertPoint());
+    } else {  // not this->last_write OR other.last_write
+        // Neither state has a write, just merge the reads
+        auto merge_op = [&other](ResourceAccessState &state) { state.ResolveRead(other); };
+        resolved = std::make_shared<const AccessState>(state_, op.InsertPoint(), merge_op);
+    }
+
+    // Add anything new to the cache
+    if (resolved) {
+        result_.CacheResolve(other_access_state, resolved);
+    }
+
+    return resolved;
+}
+
 template <typename NormalizeOp>
 void AccessContext::Trim(NormalizeOp &&normalize) {
-    ForAll(std::forward<NormalizeOp>(normalize));
+    AccessState::TransformUpdater updater(normalize);
+    ForAll(updater);
     sparse_container::consolidate(access_state_map_);
 }
 
 void AccessContext::Trim() {
-    auto normalize = [](ResourceAccessRangeMap::value_type &access) { access.second->GetState().Normalize(); };
+    auto normalize = [](ResourceAccessState &resource_state) { resource_state.Normalize(); };
     Trim(normalize);
 }
 
 void AccessContext::TrimAndClearFirstAccess() {
-    auto normalize = [](ResourceAccessRangeMap::value_type &access) {
-        access.second->GetState().Normalize();
-        access.second->GetState().ClearFirstUse();
+    auto normalize = [](ResourceAccessState &resource_state) {
+        resource_state.Normalize();
+        resource_state.ClearFirstUse();
     };
     Trim(normalize);
 }
@@ -123,10 +191,12 @@ void AccessContext::AddReferencedTags(ResourceUsageTagSet &used) const {
     ConstForAll(gather);
 }
 
-template <typename Action>
-void AccessContext::ForAll(Action &&action) {
+template <typename Updater>
+void AccessContext::ForAll(Updater &&updater) {
+    AccessState::OpContext op = MakeOpContext();
+
     for (auto &access : access_state_map_) {
-        action(access);
+        access.second = access.second->SSAUpdate(op, updater);
     }
 }
 
@@ -137,23 +207,27 @@ void AccessContext::ConstForAll(Action &&action) const {
     }
 }
 
-void AccessContext::ResolveFromContext(const AccessContext &from) { ResolveAccessMaps(from.access_state_map_, access_state_map_); }
+void AccessContext::ResolveFromContext(const AccessContext &from) {
+    ResolveAccessMaps(MakeOpContext(), from.access_state_map_, access_state_map_);
+}
 
 // Non-lazy import of all accesses, WaitEvents needs this.
 void AccessContext::ResolvePreviousAccesses() {
-    ResourceAccessState default_state;
     if (!prev_.size()) return;  // If no previous contexts, nothing to do
 
-    ResolveAccessMaps(ResolvePreviousAccessRangeGen(RangeGenWrapper(MapGapGen(access_state_map_)), &default_state, nullptr),
-                      access_state_map_);
+    auto prev_op = MakeOpContext();
+    SingleRangeGen single_gen(kFullRange);
+    RangeGenWrapper full_range_gen(single_gen);
+    ResolveAccessMaps(MakeOpContext(), ResolvePreviousAccessRangeGen(full_range_gen, prev_op, nullptr), access_state_map_);
+    InfillGapRangeGen(single_gen, nullptr);
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer &buffer, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
                                       const ResourceAccessRange &range, const ResourceUsageTag tag) {
     if (!SimpleBinding(buffer)) return;
     const auto base_address = ResourceBaseAddress(buffer);
-    UpdateMemoryAccessStateFunctor action(*this, current_usage, ordering_rule, tag);
-    UpdateMemoryAccessRangeState(access_state_map_, action, range + base_address);
+    UpdateMemoryAccessStateFunctor action(current_usage, ordering_rule, tag);
+    UpdateMemoryAccessRangeState(action, range + base_address, UpdateOptions::kUpdateAll);
 }
 
 void AccessContext::UpdateAccessState(const ImageState &image, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
@@ -195,8 +269,8 @@ void AccessContext::UpdateAccessState(const AttachmentViewGen &view_gen, Attachm
 
 void AccessContext::UpdateAccessState(ImageRangeGen &range_gen, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
                                       ResourceUsageTag tag) {
-    UpdateMemoryAccessStateFunctor action(*this, current_usage, ordering_rule, tag);
-    UpdateMemoryAccessState(action, range_gen);
+    UpdateMemoryAccessStateFunctor action(current_usage, ordering_rule, tag);
+    UpdateMemoryAccessState(action, range_gen, UpdateOptions::kUpdateAll);
 }
 
 void AccessContext::UpdateAccessState(const ImageRangeGen &range_gen, SyncStageAccessIndex current_usage,
@@ -210,7 +284,7 @@ void AccessContext::ResolveChildContexts(const std::vector<AccessContext> &conte
     for (uint32_t subpass_index = 0; subpass_index < contexts.size(); subpass_index++) {
         auto &context = contexts[subpass_index];
         ApplyTrackbackStackAction barrier_action(context.GetDstExternalTrackBack().barriers);
-        ResolveFromContext(barrier_action, context, nullptr, false);
+        ResolveFromContext(barrier_action, context, false, false);
     }
 }
 
@@ -416,16 +490,7 @@ HazardResult AccessContext::DetectImageBarrierHazard(const SyncImageMemoryBarrie
                                     image_barrier.barrier.src_access_scope, image_barrier.range, kDetectAll);
 }
 
-ResourceAccessRangeMap::iterator AccessContext::UpdateMemoryAccessStateFunctor::Infill(ResourceAccessRangeMap *accesses,
-                                                                                       const Iterator &pos,
-                                                                                       const ResourceAccessRange &range) const {
-    // this is only called on gaps, and never returns a gap.
-    ResourceAccessState default_state;
-    ResolveAccessMaps(context.ResolvePreviousAccessRangeGen(SingleRangeGen(range), &default_state, nullptr), *accesses);
-    return accesses->lower_bound(range);
-}
-void AccessContext::UpdateMemoryAccessStateFunctor::operator()(const ResourceAccessRangeMap::iterator &pos) const {
-    auto &access_state = pos->second->GetState();
+void AccessContext::UpdateMemoryAccessStateFunctor::operator()(ResourceAccessState &access_state) const {
     access_state.Update(usage_info, ordering_rule, tag);
 }
 
@@ -498,7 +563,8 @@ AttachmentViewGen::Gen AttachmentViewGen::GetDepthStencilRenderAreaGenType(bool 
     return kRenderArea;
 }
 
-void AccessContext::ResolveAccessMaps(const ResourceAccessRangeMap &from, ResourceAccessRangeMap &to) {
+void AccessContext::ResolveAccessMaps(const AccessState::OpContext &op, const ResourceAccessRangeMap &from,
+                                      ResourceAccessRangeMap &to) {
     ResourceRangeMergeIterator current(to, from, 0);
     while (current->range.non_empty()) {
         const auto current_range = current->range;
@@ -507,19 +573,30 @@ void AccessContext::ResolveAccessMaps(const ResourceAccessRangeMap &from, Resour
             const ResourceAccessState &access = src_pos->second->GetState();
             if (current->pos_A->valid) {
                 const auto &dst_pos = current->pos_A->lower_bound;
+                // If dst is the resolved state, resolved gets nullptr, s.t. we can skip the move.
+                AccessStateConstPtr resolved = dst_pos->second->SSAResolve(src_pos->second, op);
+
                 if (dst_pos->first == current_range) {
                     // The current destination covers the current range, so we can just update it
-                    dst_pos->second->GetState().Resolve(access);
+                    // See if we can avoid the resolver
+                    if (resolved) {
+                        dst_pos->second = std::move(resolved);
+                    }
                 } else {
                     // The current destination only partially matches current range, so split to only modify
-                    // the intersection
+                    // the intersection.
+                    // Note: I believe we still need to split because just because the current dst is correct for the current
+                    //       piece of src, doesn't mean the next piece will be, and we've been spliting as we go.
                     const auto trimmed = sparse_container::split(current->pos_A->lower_bound, to, current_range);
-                    trimmed->second->GetState().Resolve(access);
+                    if (resolved) {
+                        trimmed->second = std::move(resolved);
+                    }
                     current.invalidate_A(trimmed);
                 }
             } else {
-                auto inserted =
-                    to.insert(current->pos_A->lower_bound, std::make_pair(current_range, std::make_shared<AccessState>(access)));
+                // See NOTE near SSAResolve re: deep and shallow copies of "other" regarding the maked_shared versus pointer copy
+                auto inserted = to.insert(current->pos_A->lower_bound,
+                                          std::make_pair(current_range, std::make_shared<AccessState>(access, op.InsertPoint())));
                 current.invalidate_A(inserted);  // Update the parallel iterator to point at the insert segment
             }
         }
@@ -569,11 +646,9 @@ HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, Rang
     }
 
     const bool detect_prev = (static_cast<uint32_t>(options) & DetectOptions::kDetectPrevious) != 0;
-    if (detect_prev) {
-        // Only look in locations where there are no values (i.e. in gaps in the current map
-        sparse_container::mapped_gap_generator gap_gen(access_state_map_);
-        sparse_container::intersection_generator prev_gen(range_gen, gap_gen);
-        auto prev_access_map = ResolvePreviousAccessRangeGen(prev_gen, nullptr, nullptr);
+    if (detect_prev && (prev_.size() > 0)) {
+        // PrevAccess only looks in locations where there are no values (i.e. in gaps in the current map)
+        auto prev_access_map = ResolvePreviousAccessRangeGen(range_gen, MakeOpContext(), nullptr);
         for (const auto &prev : prev_access_map) {
             hazard = detector.Detect(prev.second);
             if (hazard.IsHazard()) return hazard;
@@ -584,110 +659,117 @@ HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, Rang
 }
 
 ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeGenWrapper &gen_arg,
-                                                                    const ResourceAccessState *infill_state,
+                                                                    const AccessState::OpContext &op,
                                                                     const ResourceAccessStateFunction *previous_barrier) const {
     if (prev_.size() == 0) {
-        return InfillRangeGen(gen_arg, previous_barrier, infill_state);
-    } else {
-        // Look for something to fill the gap further along.
-        const bool single_previous = prev_.size() == 1;
-        const ResourceAccessState *recur_infill = single_previous ? infill_state : nullptr;
-        auto recur_prev = [this, &gen_arg, recur_infill, previous_barrier](const TrackBack &prev_dep) {
-            const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
-            sparse_container::intersection_generator prev_gen(sparse_container::mapped_gap_generator(access_state_map_), gen_arg);
-            return prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, recur_infill, true);
-        };
+        assert(prev_.size() > 0);
+    }
 
-        // To get RVO -- need to return an auto scope variable -- so we treat the first one specially
-        ResourceAccessRangeMap resolved(recur_prev(prev_[0]));
+    // Look for something to fill the gap further along.
+    const bool single_previous = prev_.size() == 1;
 
-        if (single_previous) {
-            // Nothing to reduce with... thus, done.
-            return resolved;
-        }
+    // Use an intersection generator to only recursively search in the gaps to the current map
+    sparse_container::intersection_generator prev_gen(sparse_container::mapped_gap_generator(access_state_map_), gen_arg);
 
-        // Otherwise we need to build a reducible array of prev to resolve.
-        std::vector<ResourceAccessRangeMap *> resolve_maps;
-        resolve_maps.reserve(prev_.size());
+    auto recur_prev = [this, &gen_arg, previous_barrier, &op, &prev_gen](const TrackBack &prev_dep) {
+        const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
+        AccessState::OpContext recur_op(op);
+        return prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, recur_op, true);
+    };
 
-        std::vector<ResourceAccessRangeMap> previous;
-        previous.reserve(prev_.size() - 1);
+    // To get RVO -- need to return an auto scope variable -- so we treat the first one specially
+    ResourceAccessRangeMap resolved(recur_prev(prev_[0]));
 
-        // This the general case
-        for (const auto &prev_dep : prev_) {
-            if (resolve_maps.empty()) {
-                // Treating the 0'th entry as special
-                resolve_maps.push_back(&resolved);
-            } else {
-                // Since previous is has a capacity of prev_.size() -1, references stored in resolve_maps are not invalidated.
-                assert(previous.size() < previous.capacity());
-                previous.emplace_back(recur_prev(prev_dep));
-                resolve_maps.push_back(&previous.back());
-            }
-        }
-
-        while (resolve_maps.size() > 1) {
-            size_t size = resolve_maps.size();
-            size_t limit = size - 1;
-            size_t half = size / 2;
-            for (size_t lower = 0; lower < half; lower++) {
-                // Result is second map
-                ResolveAccessMaps(*resolve_maps[limit - lower], *resolve_maps[lower]);
-            }
-            // Get rid of the half that was resolved (
-            resolve_maps.resize(size - half);
-        }
-        assert(resolve_maps.size() == 1);
-        assert(resolve_maps[0] == &resolved);
-        if (infill_state) {
-            // Need to gap fill, because we suppressed it in the recurrent calls to avoid tree clutter.
-            sparse_container::mapped_gap_generator gap_gen(resolved);
-            sparse_container::intersection_generator infill_gen(gen_arg, gap_gen);
-            AccessStatePtr infill_shared(std::make_shared<AccessState>(*infill_state));
-            for (; infill_gen->non_empty(); ++infill_gen) {
-                resolved.insert(infill_gen.get_second_gen().get_pos(), std::make_pair(*infill_gen, infill_shared));
-            }
-        }
+    if (single_previous) {
+        // Nothing to reduce with... thus, done.
         return resolved;
     }
-}
 
-template <typename RangeGen>
-ResourceAccessRangeMap AccessContext::InfillRangeGen(const RangeGen &gen_arg, const ResourceAccessStateFunction *previous_barrier,
-                                                     const ResourceAccessState *infill_state) {
-    using ValueType = ResourceAccessRangeMap::value_type;
-    ResourceAccessRangeMap previous_map;
-    if (infill_state) {
-        RangeGen range_gen(gen_arg);
-        if (previous_barrier) {
-            // Avoid inner loop logic with a litte duplication of the "if barrier" logic.
-            // This is needed because the previous_barrier could be an ILT which changes read/write, not just barriers
-            // or the infill state might *have* a valid read or write, which needs some barrier effect.
-            for (; !range_gen->empty(); ++range_gen) {
-                ResourceAccessState state_copy(*infill_state);
-                (*previous_barrier)(&state_copy);
-                previous_map.insert(previous_map.end(), ValueType(*range_gen, std::make_shared<AccessState>(state_copy)));
-            }
+    // Otherwise we need to build a reducible array of prev to resolve.
+    std::vector<ResourceAccessRangeMap *> resolve_maps;
+    resolve_maps.reserve(prev_.size());
+
+    std::vector<ResourceAccessRangeMap> previous;
+    previous.reserve(prev_.size() - 1);
+
+    // This the general case
+    for (const auto &prev_dep : prev_) {
+        if (resolve_maps.empty()) {
+            // Treating the 0'th entry as special
+            resolve_maps.push_back(&resolved);
         } else {
-            AccessStatePtr infill_shared(std::make_shared<AccessState>(*infill_state));
-            for (; !range_gen->empty(); ++range_gen) {
-                previous_map.insert(previous_map.end(), ValueType(*range_gen, infill_shared));
-            }
+            // Since previous is has a capacity of prev_.size() -1, references stored in resolve_maps are not invalidated.
+            assert(previous.size() < previous.capacity());
+            previous.emplace_back(recur_prev(prev_dep));
+            resolve_maps.push_back(&previous.back());
         }
     }
-    return previous_map;
+
+    AccessState::OpContext resolve_op(op);
+    while (resolve_maps.size() > 1) {
+        size_t size = resolve_maps.size();
+        size_t limit = size - 1;
+        size_t half = size / 2;
+        for (size_t lower = 0; lower < half; lower++) {
+            // Result is second map
+            ResolveAccessMaps(resolve_op, *resolve_maps[limit - lower], *resolve_maps[lower]);
+        }
+        // Get rid of the half that was resolved (
+        resolve_maps.resize(size - half);
+    }
+    return resolved;
 }
 
-AccessState::AccessState(const ResourceAccessState &copy_from, const AccessState *before) : state_(copy_from), next_(before) {
-    // Insert in linked list
-    if (before) {
-        if (before->prev_) {
-            before->prev_->next_ = this;
+template <typename CullingTransform>
+struct CullingUpdater {
+    AccessStateConstPtr operator()(const AccessState::OpContext &op_context, const AccessState &input) const {
+        ResourceAccessState updated(input.GetState());
+        bool cull = transform(updated);
+        AccessStateConstPtr result;
+        if (cull) {
+            result = op_context.DefaultState();
+        } else {
+            result = std::make_shared<const AccessState>(updated, op_context.InsertPoint());
         }
-        prev_ = before->prev_;
-        before->prev_ = this;
+        return result;
+    }
+    CullingUpdater(const CullingTransform &func) : transform(func) {}
+    const CullingTransform &transform;
+};
+
+template <typename Predicate>
+void AccessContext::ApplyPredicatedWait(const Predicate &predicate) {
+    AccessState::OpContext op_context = MakeOpContext();
+    auto transform = [this, &predicate](ResourceAccessState &state) { return state.ApplyPredicatedWait<Predicate>(predicate); };
+    // The CullingUpdater sets entries returning true from transform to OpContext::DefaultState
+    CullingUpdater updater(transform);
+
+    for (auto &access : access_state_map_) {
+        access.second = access.second->SSAUpdate(op_context, updater);
+    }
+
+    // Now purge all default value states from the map.
+    vvl::EraseIf(access_state_map_,
+                 [this](const ResourceAccessRangeMap::value_type &entry) { return entry.second == default_state_; });
+}
+
+void AccessContext::ApplyAcquireWait(ResourceUsageTag present_tag, ResourceUsageTag acquire_tag) {
+    ResourceAccessState::WaitAcquirePredicate predicate{present_tag, acquire_tag};
+    ApplyPredicatedWait(predicate);
+}
+
+void AccessContext::ApplyTaggedWait(QueueId queue_id, ResourceUsageTag tag) {
+    const bool any_queue = (queue_id == kQueueAny);
+
+    if (any_queue) {
+        // This isn't just avoid an unneeded test, but to allow *all* queues to to be waited in a single pass
+        // (and it does avoid doing the same test for every access, as well as avoiding the need for the predicate
+        // to grok Queue/Device/Wait differences.
+        ResourceAccessState::WaitTagPredicate predicate{tag};
+        ApplyPredicatedWait(predicate);
     } else {
-        prev_ = nullptr;
+        ResourceAccessState::WaitQueueTagPredicate predicate{queue_id, tag};
+        ApplyPredicatedWait(predicate);
     }
 }
 
@@ -701,3 +783,35 @@ AccessState::~AccessState() {
         next_->prev_ = prev_;
     }
 }
+
+void AccessState::InsertMutable(const AccessState *before) {
+    next_ = before;
+    if (before) {
+        if (before->prev_) {
+            before->prev_->next_ = this;
+        }
+        prev_ = before->prev_;
+        before->prev_ = this;
+    } else {
+        prev_ = nullptr;
+    }
+}
+
+const AccessState *AccessState::OpContext::InsertPoint() const {
+    return context_.DefaultAccessState().get();
+    return nullptr;
+}
+
+const AccessStateConstPtr &AccessState::OpContext::DefaultState() const {
+    return context_.DefaultAccessState();
+    // TODO: insert return statement here
+}
+
+AccessState::OpID AccessState::OpContext::Op() const {
+    return op_id_;
+    // TODO: insert return statement here
+}
+
+AccessState::OpContext::OpContext(const AccessContext &access_context) : context_(access_context), op_id_(++next_op_) {}
+
+AccessState::OpContext::OpContext(const OpContext &other_context) : OpContext(other_context.context_) {}

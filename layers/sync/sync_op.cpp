@@ -35,6 +35,7 @@
 template <typename RangeMap, typename KeyType = typename RangeMap::key_type>
 class MapRangesRangeGenerator {
   public:
+    using key_type = KeyType;
     // Default constructed is safe to dereference for "empty" test, but for no other operation.
     MapRangesRangeGenerator(const RangeMap &map, const KeyType &range) : gen_(MapGen(map), RangeGen(range)) {}
     MapRangesRangeGenerator(const MapRangesRangeGenerator &from) = default;
@@ -45,6 +46,7 @@ class MapRangesRangeGenerator {
         ++gen_;
         return *this;
     }
+    const key_type &seek_forward(const key_type &range) { return gen_.seek_forward(range); }
 
   protected:
     using MapGen = sparse_container::mapped_range_generator<RangeMap>;
@@ -59,6 +61,7 @@ using EventSimpleRangeGenerator = MapRangesRangeGenerator<ResourceAccessRangeMap
 template <typename RangeMap, typename RangeGen, typename KeyType = typename RangeMap::key_type>
 class FilteredGeneratorGenerator {
   public:
+    using key_type = KeyType;
     FilteredGeneratorGenerator(const RangeMap &map, const RangeGen &gen) : gen_(MapGen(map), gen) {}
     FilteredGeneratorGenerator(const FilteredGeneratorGenerator &from) = default;
     const KeyType &operator*() const { return *gen_; }
@@ -67,6 +70,7 @@ class FilteredGeneratorGenerator {
         ++gen_;
         return *this;
     }
+    const key_type &seek_forward(const key_type &range) { return gen_.seek_forward(range); }
 
   protected:
     using MapGen = sparse_container::mapped_range_generator<RangeMap>;
@@ -197,7 +201,7 @@ void SyncOpBarriers::ApplyBarriers(const Barriers &barriers, const FunctorFactor
         if (state) {
             auto update_action = factory.MakeApplyFunctor(queue_id, barrier.barrier, barrier.IsLayoutTransition());
             auto range_gen = factory.MakeRangeGen(*state, barrier.Range());
-            access_context->UpdateMemoryAccessState(update_action, range_gen);
+            access_context->UpdateMemoryAccessState(update_action, range_gen, update_action.UpdateOptions());
         }
     }
 }
@@ -210,7 +214,7 @@ void SyncOpBarriers::ApplyGlobalBarriers(const Barriers &barriers, const Functor
         barriers_functor.EmplaceBack(factory.MakeGlobalBarrierOpFunctor(queue_id, barrier));
     }
     auto range_gen = factory.MakeGlobalRangeGen();
-    access_context->UpdateMemoryAccessState(barriers_functor, range_gen);
+    access_context->UpdateMemoryAccessState(barriers_functor, range_gen, barriers_functor.UpdateOptions());
 }
 
 ResourceUsageTag SyncOpPipelineBarrier::Record(CommandBufferAccessContext *cb_context) {
@@ -652,7 +656,7 @@ void SyncOpWaitEvents::ReplayRecord(CommandExecutionContext &exec_context, Resou
 
     // Apply the pending barriers
     ResolvePendingBarrierFunctor apply_pending_action(exec_tag);
-    access_context->ApplyToContext(apply_pending_action);
+    access_context->ApplyToContext(apply_pending_action, apply_pending_action.UpdateOptions());
 }
 
 bool SyncOpWaitEvents::ReplayValidate(ReplayState &replay, ResourceUsageTag recorded_tag) const {
