@@ -311,6 +311,62 @@ void ResourceAccessState::ResolveReadWrite(const ResourceAccessState &other) {
     ResolveRead(other);
 }
 
+MismatchReason ResourceAccessState::Compare(const ResourceAccessState &other) const {
+    if (!(last_write == other.last_write)) {
+        return MismatchReason::write;
+    }
+
+    if (read_execution_barriers != other.read_execution_barriers) {
+        return MismatchReason::read_barriers;
+    }
+
+    if (input_attachment_read != other.input_attachment_read) {
+        return MismatchReason::read_attachment;
+    }
+
+    if (last_read_stages != other.last_read_stages) {
+        return MismatchReason::sorted_read;
+    }
+
+    if (last_reads.size()) {
+        auto reads_copy = last_reads;
+        auto other_reads_copy = other.last_reads;
+        std::sort(reads_copy.begin(), reads_copy.end());
+        std::sort(other_reads_copy.begin(), other_reads_copy.end());
+        if (reads_copy != other_reads_copy) {
+            return MismatchReason::sorted_read;
+        }
+    }
+
+    if (last_reads != other.last_reads) {
+        return MismatchReason::unsorted_read;
+    }
+
+    if (pending_layout_transition != other.pending_layout_transition) {
+        return MismatchReason::pending_layout;
+    }
+
+    if ((first_read_stages_ != other.first_read_stages_) || (first_access_closed_ != other.first_access_closed_) ||
+        (first_write_layout_ordering_ != other.first_write_layout_ordering_) || (first_accesses_ != other.first_accesses_)) {
+        return MismatchReason::first_access;
+    }
+
+    if (*this == ResourceAccessState()) return MismatchReason::none_empty;
+
+    if (last_write) {
+        if (last_reads.empty()) {
+            return MismatchReason::none_write;
+        } else {
+            return MismatchReason::none_readwrite;
+        }
+    } else if (!last_reads.empty()) {
+        return MismatchReason::none_read;
+    }
+
+    assert(other == *this);
+    return MismatchReason::none;
+}
+
 void ResourceAccessState::MergeReads(const ResourceAccessState &other) {
     // Merge the read states
     const auto pre_merge_count = last_reads.size();

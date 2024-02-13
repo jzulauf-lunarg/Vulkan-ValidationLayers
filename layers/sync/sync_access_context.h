@@ -509,7 +509,55 @@ class AccessContext {
     AccessStateConstPtr default_state_;
     // Get is preincrement s.t. 0 is an invalid OpID.
 };
+struct AccessStateStats {
+    static constexpr size_t kMismatchCount = static_cast<size_t>(MismatchReason::COUNT);
+    static constexpr size_t kNoneLimit = static_cast<size_t>(MismatchReason::NONE_LIMIT);
+    static size_t total_entries;
+    static size_t reused_entries;
+    static std::array<size_t, kMismatchCount> total_compare_stats;
+    std::array<size_t, kMismatchCount> total_compare_copy;
+    std::array<size_t, kMismatchCount> compare_stats;
+    std::set<AccessStateConstPtr> access_states;
+    std::set<ResourceAccessState> resource_states;
+    void Gather(const ResourceAccessRangeMap &map) {
+        access_states.clear();
+        resource_states.clear();
 
+        for (auto &s : compare_stats) s = 0;
+
+        for (const auto &elem : map) {
+            total_entries++;
+            auto access_insert = access_states.insert(elem.second);
+            if (!access_insert.second) {
+                reused_entries++;
+                continue;
+            }
+            size_t min_mismatch = kMismatchCount;
+            const auto &state = elem.second->GetState();
+            for (const auto &uniq : access_states) {
+                if (uniq == elem.second) continue;
+                size_t comparison = static_cast<size_t>(state.Compare(uniq->GetState()));
+                if (comparison < min_mismatch) {
+                    min_mismatch = comparison;
+                    if (comparison < kNoneLimit) break;
+                }
+            }
+
+            if (min_mismatch < kMismatchCount) {
+                compare_stats[min_mismatch]++;
+            } else {
+                assert(access_states.size() == 1);
+            }
+        }
+        std::array<float, kMismatchCount> total_compare_rates;
+        for (size_t i = 0; i < kMismatchCount; i++) {
+            total_compare_stats[i] += compare_stats[i];
+            total_compare_copy[i] = total_compare_stats[i];
+            total_compare_rates[i] = 100.F * static_cast<float>(total_compare_stats[i]) / static_cast<float>(total_entries);
+        }
+        float resuse_rate = 100.F * (float)reused_entries / (float)total_entries;
+    }
+};
 struct NoopBarrierAction {
     explicit NoopBarrierAction() {}
     void operator()(ResourceAccessState &) const {}

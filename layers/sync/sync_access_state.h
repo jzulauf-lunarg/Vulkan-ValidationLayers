@@ -196,6 +196,7 @@ struct OrderingBarrier {
     bool operator==(const OrderingBarrier &rhs) const {
         return (exec_scope == rhs.exec_scope) && (access_scope == rhs.access_scope);
     }
+    bool operator!=(const OrderingBarrier &rhs) const { return !(*this == rhs); }
 };
 
 using ResourceUsageTagSet = CachedInsertSet<ResourceUsageTag, 4>;
@@ -204,8 +205,10 @@ class ResourceAccessWriteState {
   public:
     bool operator==(const ResourceAccessWriteState &rhs) const {
         return (access_ == rhs.access_) && (barriers_ == rhs.barriers_) && (tag_ == rhs.tag_) && (queue_ == rhs.queue_) &&
-               (dependency_chain_ == rhs.dependency_chain_);
+               (dependency_chain_ == rhs.dependency_chain_) && (pending_layout_ordering_ == rhs.pending_layout_ordering_) &&
+               (pending_dep_chain_ == rhs.pending_dep_chain_) && (pending_barriers_ == rhs.pending_barriers_);
     }
+
     bool WriteInChain(VkPipelineStageFlags2KHR src_exec_scope) const;
     bool WriteInScope(const SyncStageAccessFlags &src_access_scope) const;
     bool WriteInSourceScopeOrChain(VkPipelineStageFlags2KHR src_exec_scope, SyncStageAccessFlags src_access_scope) const;
@@ -256,6 +259,23 @@ class ResourceAccessWriteState {
     SyncStageAccessFlags pending_barriers_;
 
     friend ResourceAccessState;
+};
+
+enum class MismatchReason {
+    none = 0,
+    none_empty,
+    none_read,
+    none_write,
+    none_readwrite,
+    first_access,
+    NONE_LIMIT = first_access,
+    unsorted_read,
+    sorted_read,
+    read_attachment,
+    read_barriers,
+    write,
+    pending_layout,
+    COUNT
 };
 
 class ResourceAccessState : public SyncStageAccess {
@@ -405,8 +425,8 @@ class ResourceAccessState : public SyncStageAccess {
 
         const bool read_write_same = write_same && (last_read_stages == rhs.last_read_stages) && (last_reads == rhs.last_reads);
 
-        const bool same = read_write_same && (first_accesses_ == rhs.first_accesses_) &&
-                          (first_read_stages_ == rhs.first_read_stages_) &&
+        const bool same = read_write_same && (pending_layout_transition == rhs.pending_layout_transition) &&
+                          (first_accesses_ == rhs.first_accesses_) && (first_read_stages_ == rhs.first_read_stages_) &&
                           (first_write_layout_ordering_ == rhs.first_write_layout_ordering_);
 
         return same;
@@ -463,6 +483,8 @@ class ResourceAccessState : public SyncStageAccess {
 
     void ResolveRead(const ResourceAccessState &other);
     void ResolveReadWrite(const ResourceAccessState &other);
+
+    MismatchReason Compare(const ResourceAccessState &other) const;
 
   private:
     static constexpr VkPipelineStageFlags2KHR kInvalidAttachmentStage = ~VkPipelineStageFlags2KHR(0);

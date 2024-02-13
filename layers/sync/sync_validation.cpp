@@ -594,6 +594,16 @@ void SyncValidator::PostCallRecordBeginCommandBuffer(VkCommandBuffer commandBuff
     cb_state->access_context.Reset();
 }
 
+void SyncValidator::PostCallRecordEndCommandBuffer(VkCommandBuffer commandBuffer, const RecordObject &record_obj) {
+    // Clean up local whatever WIP WIP
+    auto cb_state = Get<syncval_state::CommandBuffer>(commandBuffer);
+    AccessStateStats stats;
+    stats.Gather(cb_state->access_context.GetCurrentAccessContext()->GetAccessStateMap());
+
+    // The state tracker sets up the command buffer state
+    StateTracker::PostCallRecordEndCommandBuffer(commandBuffer, record_obj);
+}
+
 void SyncValidator::RecordCmdBeginRenderPass(VkCommandBuffer commandBuffer, const VkRenderPassBeginInfo *pRenderPassBegin,
                                              const VkSubpassBeginInfo *pSubpassBeginInfo, Func command) {
     auto cb_state = Get<syncval_state::CommandBuffer>(commandBuffer);

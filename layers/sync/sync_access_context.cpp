@@ -21,6 +21,10 @@
 
 std::atomic<AccessState::OpID> AccessState::OpContext::next_op_(0);
 
+size_t AccessStateStats::total_entries = 0;
+size_t AccessStateStats::reused_entries = 0;
+std::array<size_t, static_cast<size_t>(MismatchReason::COUNT)> AccessStateStats::total_compare_stats;
+
 bool SimpleBinding(const BINDABLE &bindable) { return !bindable.sparse && bindable.Binding(); }
 VkDeviceSize ResourceBaseAddress(const vvl::Buffer &buffer) { return buffer.GetFakeBaseAddress(); }
 
