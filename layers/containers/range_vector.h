@@ -2057,17 +2057,19 @@ class mapped_range_generator {
     }
 
     const key_type &seek_forward(const key_type &range) {
-        const static int kRetryLimit = 2;  // TODO -- determine whether this limit is optimal
+        const static int kRetryLimit = 1;  // TODO -- determine whether this limit is optimal
         int retry_count = 0;
         assert(pos_ != map_.cend());
         while (!current_.empty() && (current_.end <= range.begin)) {
             if (retry_count < kRetryLimit) {
                 ++pos_;
+                update_current();
             } else {
                 // Okay we've tried walking, do a seek.
                 pos_ = map_.lower_bound(range);
+                update_current();
+                break;
             }
-            update_current();
         }
         return current_;
     }
