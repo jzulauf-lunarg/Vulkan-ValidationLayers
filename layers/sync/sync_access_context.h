@@ -175,7 +175,9 @@ class AccessState {
     // Treat the access state as a "static single assignment" of a ResourceAccessState, allowing safe sharing by many address
     // ranges, with the results of a given op
     // TODO: Make this const when we have constructors that can apply update operations during construction
-    const ResourceAccessState state_;
+    std::shared_ptr<const ResourceAccessState> state_;
+    std::shared_ptr<const PendingBarriers> pending_;
+    std::shared_ptr<const FirstAccesses> first_;
 
     // Temporary result for current operation on AccessContext
     mutable OpResult result_;

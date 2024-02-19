@@ -20,6 +20,7 @@
 
 class ResourceAccessState;
 class ResourceAccessWriteState;
+class PendingBarriers;
 struct ResourceFirstAccess;
 
 // NOTE: the attachement read flag is put *only* in the access scope and not in the exect scope, since the ordering
@@ -199,14 +200,26 @@ struct OrderingBarrier {
     bool operator!=(const OrderingBarrier &rhs) const { return !(*this == rhs); }
 };
 
+struct FirstAccesses {
+    using AccessList = small_vector<ResourceFirstAccess, 3>;
+    AccessList accesses;
+    VkPipelineStageFlags2KHR read_stages;
+    OrderingBarrier write_layout_ordering;
+    bool closed;
+
+    void Merge(const FirstAccesses &other);
+    void Reset();
+    void Update(ResourceUsageTag tag, const SyncStageAccessInfoType &usage_info, VkPipelineStageFlags2KHR read_execution_barriers,
+                SyncOrdering ordering_rule);
+};
+
 using ResourceUsageTagSet = CachedInsertSet<ResourceUsageTag, 4>;
 
 class ResourceAccessWriteState {
   public:
     bool operator==(const ResourceAccessWriteState &rhs) const {
         return (access_ == rhs.access_) && (barriers_ == rhs.barriers_) && (tag_ == rhs.tag_) && (queue_ == rhs.queue_) &&
-               (dependency_chain_ == rhs.dependency_chain_) && (pending_layout_ordering_ == rhs.pending_layout_ordering_) &&
-               (pending_dep_chain_ == rhs.pending_dep_chain_) && (pending_barriers_ == rhs.pending_barriers_);
+               (dependency_chain_ == rhs.dependency_chain_);
     }
 
     bool WriteInChain(VkPipelineStageFlags2KHR src_exec_scope) const;
@@ -238,11 +251,8 @@ class ResourceAccessWriteState {
     void MergeBarriers(const ResourceAccessWriteState &other);
     void OffsetTag(ResourceUsageTag offset) { tag_ += offset; }
 
-    bool HasPendingState() const { return pending_barriers_.any() || (0 != pending_dep_chain_); }
-    void ClearPending();
     void UpdatePendingBarriers(const SyncBarrier &barrier);
-    void ApplyPendingBarriers();
-    void UpdatePendingLayoutOrdering(const SyncBarrier &barrier);
+    void ApplyPendingBarriers(const PendingBarriers &pending);
     const OrderingBarrier &GetPendingLayoutOrdering() const { return pending_layout_ordering_; }
 
   private:
@@ -252,11 +262,6 @@ class ResourceAccessWriteState {
     QueueId queue_;
     // intially zero, but accumulating the dstStages of barriers if they chain.
     VkPipelineStageFlags2KHR dependency_chain_;
-
-    // Write specific layout state
-    OrderingBarrier pending_layout_ordering_;
-    VkPipelineStageFlags2KHR pending_dep_chain_;
-    SyncStageAccessFlags pending_barriers_;
 
     friend ResourceAccessState;
 };
@@ -281,7 +286,6 @@ enum class MismatchReason {
 class ResourceAccessState : public SyncStageAccess {
   protected:
     using OrderingBarriers = std::array<OrderingBarrier, static_cast<size_t>(SyncOrdering::kNumOrderings)>;
-    using FirstAccesses = small_vector<ResourceFirstAccess, 3>;
 
   public:
     // KILl KILL KILL WIP WIP WIP
@@ -304,17 +308,24 @@ class ResourceAccessState : public SyncStageAccess {
         VkPipelineStageFlags2KHR sync_stages;  // reads known to have happened after this
         ResourceUsageTag tag;
         QueueId queue;
+#ifdef WIP_DCC
         VkPipelineStageFlags2KHR pending_dep_chain;  // Should be zero except during barrier application
                                                      // Excluded from comparison
+#endif
         ReadState() = default;
         ReadState(VkPipelineStageFlags2KHR stage_, SyncStageAccessFlags access_, VkPipelineStageFlags2KHR barriers_,
                   ResourceUsageTag tag_);
         bool operator==(const ReadState &rhs) const {
             return (stage == rhs.stage) && (access == rhs.access) && (barriers == rhs.barriers) &&
-                   (sync_stages == rhs.sync_stages) && (tag == rhs.tag) && (queue == rhs.queue) &&
-                   (pending_dep_chain == rhs.pending_dep_chain);
+                   (sync_stages == rhs.sync_stages) && (tag == rhs.tag) && (queue == rhs.queue)
+#ifdef WIP_DCC
+                   && (pending_dep_chain == rhs.pending_dep_chain)
+#endif
+                ;
         }
+#ifdef WIP_DCC
         void Normalize() { pending_dep_chain = VK_PIPELINE_STAGE_2_NONE; }
+#endif
         bool IsReadBarrierHazard(VkPipelineStageFlags2KHR src_exec_scope) const {
             // If the read stage is not in the src sync scope
             // *AND* not execution chained with an existing sync barrier (that's the or)
@@ -350,7 +361,7 @@ class ResourceAccessState : public SyncStageAccess {
     HazardResult DetectHazard(const SyncStageAccessInfoType &usage_info) const;
     HazardResult DetectHazard(const SyncStageAccessInfoType &usage_info, SyncOrdering ordering_rule, QueueId queue_id) const;
     HazardResult DetectHazard(const SyncStageAccessInfoType &usage_info, const OrderingBarrier &ordering, QueueId queue_id) const;
-    HazardResult DetectHazard(const ResourceAccessState &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range) const;
+    HazardResult DetectHazard(const FirstAccesses &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range) const;
 
     HazardResult DetectAsyncHazard(const SyncStageAccessInfoType &usage_info, ResourceUsageTag start_tag) const;
     HazardResult DetectAsyncHazard(const ResourceAccessState &recorded_use, const ResourceUsageRange &tag_range,
@@ -370,8 +381,8 @@ class ResourceAccessState : public SyncStageAccess {
     void ApplyBarriers(const std::vector<SyncBarrier> &barriers, bool layout_transition);
     void ApplyBarriersImmediate(const std::vector<SyncBarrier> &barriers);
     template <typename ScopeOps>
-    void ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barrier, bool layout_transition);
-    void ApplyPendingBarriers(ResourceUsageTag tag);
+    void ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barrier, bool layout_transition, PendingBarriers &pending) const;
+    void ApplyPendingBarriers(ResourceUsageTag tag, const PendingBarriers &pending);
     void ApplySemaphore(const SemaphoreScope &signal, const SemaphoreScope wait);
 
     struct WaitQueueTagPredicate {
@@ -506,7 +517,6 @@ class ResourceAccessState : public SyncStageAccess {
     }
     VkPipelineStageFlags2 GetOrderedStages(QueueId queue_id, const OrderingBarrier &ordering) const;
 
-    void UpdateFirst(ResourceUsageTag tag, const SyncStageAccessInfoType &usage_info, SyncOrdering ordering_rule);
     void TouchupFirstForLayoutTransition(ResourceUsageTag tag, const OrderingBarrier &layout_ordering);
 
     void MergePending(const ResourceAccessState &other);
@@ -536,16 +546,38 @@ class ResourceAccessState : public SyncStageAccess {
     // Tracks whether the fragment shader read is input attachment read
     bool input_attachment_read;
 
+    static OrderingBarriers kOrderingRules;
+};
+
+class PendingBarriers {
+    friend ResourceAccessState;
+
+  public:
+    // Mutliple read operations can be simlutaneously (and independently) synchronized,
+    struct ReadBarrier {
+        VkPipelineStageFlags2KHR dep_chain;  // Should be zero except during barrier application
+                                             // Excluded from comparison
+        ReadBarrier() = default;
+        ReadBarrier(const ResourceAccessState::ReadState &read_state);
+        bool operator==(const ReadBarrier &rhs) const { return (dep_chain == rhs.dep_chain); }
+        bool operator!=(const ReadBarrier &rhs) const { return !(*this == rhs); }
+
+        void ApplyReadBarrier(VkPipelineStageFlags2KHR dst_scope) { dep_chain |= dst_scope; }
+        VkPipelineStageFlags2 ApplyPendingBarriers();
+    };
+
+    void MergeWriteBarriers(const PendingBarriers &other);
+    void UpdateWriteBarriers(const SyncBarrier &barrier, bool layout_transition);
+
+  protected:
     // Not part of the write state, logically.  Can exist when !last_write
     // Pending execution state to support independent parallel barriers
-    bool pending_layout_transition;
+    bool layout_transition_;
 
-    FirstAccesses first_accesses_;
-    VkPipelineStageFlags2KHR first_read_stages_;
-    OrderingBarrier first_write_layout_ordering_;
-    bool first_access_closed_;
-
-    static OrderingBarriers kOrderingRules;
+    // Write specific layout state
+    OrderingBarrier layout_ordering_;
+    VkPipelineStageFlags2KHR write_dep_chain_;
+    SyncStageAccessFlags write_barriers_;
 };
 
 using ResourceAccessStateFunction = std::function<void(ResourceAccessState &)>;
@@ -555,7 +587,8 @@ using ResourceAccessStateFunction = std::function<void(ResourceAccessState &)>;
 // of the batch have been processed. Also, depending on whether layout transition happens, we'll either
 // replace the current write barriers or add to them, so accumulate to pending as well.
 template <typename ScopeOps>
-void ResourceAccessState::ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barrier, bool layout_transition) {
+void ResourceAccessState::ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barrier, bool layout_transition,
+                                       PendingBarriers &pending) const {
     // For independent barriers we need to track what the new barriers and dependency chain *will* be when we're done
     // applying the memory barriers
     // NOTE: We update the write barrier if the write is in the first access scope or if there is a layout
@@ -566,8 +599,7 @@ void ResourceAccessState::ApplyBarrier(ScopeOps &&scope, const SyncBarrier &barr
         if (!last_write.has_value()) {
             last_write.emplace(UsageInfo(SYNC_ACCESS_INDEX_NONE), 0U);
         }
-        last_write->UpdatePendingBarriers(barrier);
-        last_write->UpdatePendingLayoutOrdering(barrier);
+        pending->UpdateWriteBarriers(barrier, layout_transition);
         pending_layout_transition = true;
     } else {
         if (scope.WriteInScope(barrier, *this)) {

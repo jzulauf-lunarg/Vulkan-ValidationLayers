@@ -147,15 +147,15 @@ HazardResult ResourceAccessState::DetectHazard(const SyncStageAccessInfoType &us
     return hazard;
 }
 
-HazardResult ResourceAccessState::DetectHazard(const ResourceAccessState &recorded_use, QueueId queue_id,
+HazardResult ResourceAccessState::DetectHazard(const FirstAccesses &recorded_use, QueueId queue_id,
                                                const ResourceUsageRange &tag_range) const {
     HazardResult hazard;
-    using Size = FirstAccesses::size_type;
-    const auto &recorded_accesses = recorded_use.first_accesses_;
+    using Size = FirstAccesses::AccessList::size_type;
+    const auto &recorded_accesses = recorded_use.accesses;
     Size count = recorded_accesses.size();
     if (count) {
         // First access is only closed if the last is a write
-        bool do_write_last = recorded_use.first_access_closed_;
+        bool do_write_last = recorded_use.closed;
         if (do_write_last) {
             // Note: We know count > 0 so this is alway safe.
             --count;
@@ -186,16 +186,16 @@ HazardResult ResourceAccessState::DetectHazard(const ResourceAccessState &record
                     // Or in the layout first access scope as a barrier... IFF the usage is an ILT
                     // this was saved off in the "apply barriers" logic to simplify ILT access checks as they straddle
                     // the barrier that applies them
-                    barrier |= recorded_use.first_write_layout_ordering_;
+                    barrier |= recorded_use.write_layout_ordering;
                 }
                 // Any read stages present in the recorded context (this) are most recent to the write, and thus mask those stages
                 // in the active context
-                if (recorded_use.first_read_stages_) {
+                if (recorded_use.read_stages) {
                     // we need to ignore the first use read stage in the active context (so we add them to the ordering rule),
                     // reads in the active context are not "most recent" as all recorded context operations are *after* them
                     // This supresses only RAW checks for stages present in the recorded context, but not those only present in the
                     // active context.
-                    barrier.exec_scope |= recorded_use.first_read_stages_;
+                    barrier.exec_scope |= recorded_use.read_stages;
                     // if there are any first use reads, we suppress WAW by injecting the active context write in the ordering rule
                     barrier.access_scope |= last_access.usage_info->stage_access_bit;
                 }
@@ -280,13 +280,13 @@ void ResourceAccessState::MergePending(const ResourceAccessState &other) {
     pending_layout_transition |= other.pending_layout_transition;
 }
 
-void ResourceAccessState::MergeFirstUse(const ResourceAccessState &other) {
-    if (!(first_accesses_ == other.first_accesses_) && !other.first_accesses_.empty()) {
-        FirstAccesses firsts(std::move(first_accesses_));
-        ClearFirstUse();
+void FirstAccesses::Merge(const FirstAccesses &other) {
+    if (!(accesses == other.accesses) && !other.accesses.empty()) {
+        AccessList firsts(std::move(accesses));
+        Reset();
         auto a = firsts.begin();
         auto a_end = firsts.end();
-        for (auto &b : other.first_accesses_) {
+        for (auto &b : other.accesses) {
             // TODO: Determine whether some tag offset will be needed for PHASE II
             while ((a != a_end) && (a->tag < b.tag)) {
                 UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
@@ -299,6 +299,7 @@ void ResourceAccessState::MergeFirstUse(const ResourceAccessState &other) {
         }
     }
 }
+
 void ResourceAccessState::ResolveRead(const ResourceAccessState &other) {
     MergePending(other);
     MergeReads(other);
@@ -417,111 +418,6 @@ void ResourceAccessState::MergeReads(const ResourceAccessState &other) {
     read_execution_barriers |= other.read_execution_barriers;
 }
 
-#if 0
-// The logic behind resolves is the same as update, we assume that earlier hazards have be reported, and that no
-// tranistive hazard can exists with a hazard between the earlier operations.  Yes, an early hazard can mask that another
-// exists, but if you fix *that* hazard it either fixes or unmasks the subsequent ones.
-void ResourceAccessState::Resolve(const ResourceAccessState &other) {
-    bool skip_first = false;
-    if (last_write.has_value()) {
-        if (other.last_write.has_value()) {
-            if (last_write->Tag() < other.last_write->Tag()) {
-                // NOTE: Both last and other have writes, and thus first access is "closed". We are selecting other's
-                //       first_access state, but it and this can only differ if there are async hazards
-                //       error state.
-                //
-                // If this is a later write, we've reported any exsiting hazard, and we can just overwrite as the more recent
-                // operation
-                *this = other;
-                skip_first = true;
-            } else if (last_write->Tag() == other.last_write->Tag()) {
-                // In the *equals* case for write operations, we merged the write barriers and the read state (but without the
-                // dependency chaining logic or any stage expansion)
-                last_write->MergeBarriers(*other.last_write);
-                MergePending(other);
-                MergeReads(other);
-            } else {
-                // other write is before this write... in which case we keep this instead of other
-                // and can skip the "first_access" merge, since first_access has been closed since other write tag or before
-                skip_first = true;
-            }
-        } else {
-            // this has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
-            // Since this has a write first access is closed and shouldn't be updated by other
-            skip_first = true;
-        }
-    } else if (other.last_write.has_value()) {  // && not this->last_write
-        // Other has write and this doesn't, thus keep it, See first access NOTE above
-        *this = other;
-        skip_first = true;
-    } else {  // not this->last_write OR other.last_write
-        // Neither state has a write, just merge the reads
-        MergePending(other);
-        MergeReads(other);
-    }
-
-    // Merge first access information by making a copy of this first_access and reconstructing with a shuffle
-    // of the copy and other into this using the update first logic.
-    // NOTE: All sorts of additional cleverness could be put into short circuts.  (for example back is write and is before front
-    //       of the other first_accesses... )
-    if (!skip_first && !(first_accesses_ == other.first_accesses_) && !other.first_accesses_.empty()) {
-        FirstAccesses firsts(std::move(first_accesses_));
-        ClearFirstUse();
-        auto a = firsts.begin();
-        auto a_end = firsts.end();
-        for (auto &b : other.first_accesses_) {
-            // TODO: Determine whether some tag offset will be needed for PHASE II
-            while ((a != a_end) && (a->tag < b.tag)) {
-                UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
-                ++a;
-            }
-            UpdateFirst(b.tag, *b.usage_info, b.ordering_rule);
-        }
-        for (; a != a_end; ++a) {
-            UpdateFirst(a->tag, *a->usage_info, a->ordering_rule);
-        }
-    }
-
-}
-#endif
-
-#if 0
-ResourceAccessState::ResolveOp ResourceAccessState::ComputeResolveOp(const ResourceAccessState &other) {
-    bool skip_first = false;
-    if (last_write.has_value()) {
-        if (other.last_write.has_value()) {
-            if (last_write->Tag() < other.last_write->Tag()) {
-                // NOTE: Both last and other have writes, and thus first access is "closed". We are selecting other's
-                //       first_access state, but it and this can only differ if there are async hazards
-                //       error state.
-                //
-                // If this is a later write, we've reported any exsiting hazard, and we can just overwrite as the more recent
-                // operation
-                return ResolveOp::TakeOther;
-            } else if (last_write->Tag() == other.last_write->Tag()) {
-                // In the *equals* case for write operations, we merged the write barriers and the read state (but without the
-                // dependency chaining logic or any stage expansion)
-                return ResolveOp::MergeReadWrite;
-            } else {
-                // other write is before this write... in which case we keep this instead of other
-                // and can skip the "first_access" merge, since first_access has been closed since other write tag or before
-                return ResolveOp::TakeThis;
-            }
-        } else {
-            // this has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
-            // Since this has a write first access is closed and shouldn't be updated by other
-            return ResolveOp::TakeThis;
-        }
-    } else if (other.last_write.has_value()) {  // && not this->last_write
-        // Other has write and this doesn't, thus keep it, See first access NOTE above
-        return ResolveOp::TakeOther;
-    } else {  // not this->last_write OR other.last_write
-        // Neither state has a write, just merge the reads
-        return ResolveOp::MergeReads;
-    }
-}
-#endif
-
 void ResourceAccessState::Update(const SyncStageAccessInfoType &usage_info, SyncOrdering ordering_rule,
                                  const ResourceUsageTag tag) {
     // Move this logic in the ResourceStateTracker as methods, thereof (or we'll repeat it for every flavor of resource...
@@ -610,34 +506,28 @@ void ResourceAccessState::ClearRead() {
     input_attachment_read = false;  // Denotes no outstanding input attachment read after the last write.
 }
 
-void ResourceAccessState::ClearPending() {
-    pending_layout_transition = false;
-    if (last_write.has_value()) last_write->ClearPending();
+void FirstAccesses::Reset() {
+    accesses.clear();
+    read_stages = VK_PIPELINE_STAGE_2_NONE;
+    write_layout_ordering = OrderingBarrier();
+    closed = false;
 }
 
-void ResourceAccessState::ClearFirstUse() {
-    first_accesses_.clear();
-    first_read_stages_ = VK_PIPELINE_STAGE_2_NONE;
-    first_write_layout_ordering_ = OrderingBarrier();
-    first_access_closed_ = false;
-}
-
-void ResourceAccessState::ApplyPendingBarriers(const ResourceUsageTag tag) {
-    if (pending_layout_transition) {
+void ResourceAccessState::ApplyPendingBarriers(const ResourceUsageTag tag, const PendingBarriers &pending) {
+    if (pending.layout_transition_) {
         // SetWrite clobbers the last_reads array, and thus we don't have to clear the read_state out.
         const SyncStageAccessInfoType &layout_usage_info = UsageInfo(SYNC_IMAGE_LAYOUT_TRANSITION);
         SetWrite(layout_usage_info, tag);  // Side effect notes below
         UpdateFirst(tag, layout_usage_info, SyncOrdering::kNonAttachment);
-        TouchupFirstForLayoutTransition(tag, last_write->GetPendingLayoutOrdering());
+        TouchupFirstForLayoutTransition(tag, pending.layout_ordering_);
 
-        last_write->ApplyPendingBarriers();
-        last_write->ClearPending();
-        pending_layout_transition = false;
+        last_write->ApplyPendingBarriers(pending);
     } else {
         // Apply the accumulate execution barriers (and thus update chaining information)
         // for layout transition, last_reads is reset by SetWrite, so this will be skipped.
-        for (auto &read_access : last_reads) {
-            read_execution_barriers |= read_access.ApplyPendingBarriers();
+        for (auto [index, read_access] : vvl::enumerate(last_reads.begin(), last_reads.size())) {
+            const auto &pending_read_barrier = pending.read_barriers_[index];
+            read_execution_barriers |= read_access->ApplyPendingBarriers(pending_read_barrier);
         }
 
         // We OR in the accumulated write chain and barriers even in the case of a layout transition as SetWrite zeros them.
@@ -832,20 +722,20 @@ VkPipelineStageFlags2 ResourceAccessState::GetOrderedStages(QueueId queue_id, co
     return ordered_stages;
 }
 
-void ResourceAccessState::UpdateFirst(const ResourceUsageTag tag, const SyncStageAccessInfoType &usage_info,
-                                      SyncOrdering ordering_rule) {
+void FirstAccesses::Update(const ResourceUsageTag tag, const SyncStageAccessInfoType &usage_info,
+                           VkPipelineStageFlags2KHR read_execution_barriers, SyncOrdering ordering_rule) {
     // Only record until we record a write.
-    if (!first_access_closed_) {
-        const bool is_read = IsRead(usage_info);
+    if (!closed) {
+        const bool is_read = SyncStageAccess::IsRead(usage_info);
         const VkPipelineStageFlags2KHR usage_stage = is_read ? usage_info.stage_mask : 0U;
-        if (0 == (usage_stage & first_read_stages_)) {
+        if (0 == (usage_stage & read_stages)) {
             // If this is a read we haven't seen or a write, record.
             // We always need to know what stages were found prior to write
-            first_read_stages_ |= usage_stage;
+            read_stages |= usage_stage;
             if (0 == (read_execution_barriers & usage_stage)) {
                 // If this stage isn't masked then we add it (since writes map to usage_stage 0, this also records writes)
-                first_accesses_.emplace_back(tag, usage_info, ordering_rule);
-                first_access_closed_ = !is_read;
+                accesses.emplace_back(tag, usage_info, ordering_rule);
+                closed = !is_read;
             }
         }
     }
@@ -943,33 +833,34 @@ void ResourceAccessWriteState::Set(const SyncStageAccessInfoType &usage_info, Re
     queue_ = kQueueIdInvalid;
 }
 
-void ResourceAccessWriteState::MergeBarriers(const ResourceAccessWriteState &other) {
+void ResourceAccessWriteState::MergeBarriers(const ResourceAccessWriteState &other, PendingBarriers *pending,
+                                             PendingBarriers *other_pending) {
     barriers_ |= other.barriers_;
     dependency_chain_ |= other.dependency_chain_;
 
-    pending_barriers_ |= other.pending_barriers_;
-    pending_dep_chain_ |= other.pending_dep_chain_;
-    pending_layout_ordering_ |= other.pending_layout_ordering_;
+    if (pending && other_pending) {
+        pending->MergeWriteBarriers(*other_pending);
+    }
 }
 
-void ResourceAccessWriteState::UpdatePendingBarriers(const SyncBarrier &barrier) {
-    pending_barriers_ |= barrier.dst_access_scope;
-    pending_dep_chain_ |= barrier.dst_exec_scope.exec_scope;
+void PendingBarriers::MergeWriteBarriers(const PendingBarriers &other) {
+    write_barriers_ |= other.write_barriers_;
+    write_dep_chain_ |= other.write_dep_chain_;
+    layout_ordering_ |= other.layout_ordering_;
 }
 
-void ResourceAccessWriteState::ApplyPendingBarriers() {
-    dependency_chain_ |= pending_dep_chain_;
-    barriers_ |= pending_barriers_;
+void PendingBarriers::UpdateWriteBarriers(const SyncBarrier &barrier, bool layout_transition) {
+    write_barriers_ |= barrier.dst_access_scope;
+    write_dep_chain_ |= barrier.dst_exec_scope.exec_scope;
+    if (layout_transition) {
+        layout_transition_ = true;
+        layout_ordering_ |= OrderingBarrier(barrier.src_exec_scope.exec_scope, barrier.src_access_scope);
+    }
 }
 
-void ResourceAccessWriteState::UpdatePendingLayoutOrdering(const SyncBarrier &barrier) {
-    pending_layout_ordering_ |= OrderingBarrier(barrier.src_exec_scope.exec_scope, barrier.src_access_scope);
-}
-
-void ResourceAccessWriteState::ClearPending() {
-    pending_dep_chain_ = VK_PIPELINE_STAGE_2_NONE;
-    pending_barriers_.reset();
-    pending_layout_ordering_ = OrderingBarrier();
+void ResourceAccessWriteState::ApplyPendingBarriers(const PendingBarriers &pending) {
+    dependency_chain_ |= pending.write_dep_chain_;
+    barriers_ |= pending.write_barriers_;
 }
 
 void ResourceAccessWriteState::SetQueueId(QueueId id) {
