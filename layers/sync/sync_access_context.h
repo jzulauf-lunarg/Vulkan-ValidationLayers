@@ -472,8 +472,8 @@ class AccessContext {
     HazardResult DetectHazardRange(Detector &detector, const ResourceAccessRange &range, DetectOptions options) const;
     template <typename Detector, typename RangeGen>
     HazardResult DetectHazardGeneratedRanges(Detector &detector, RangeGen &range_gen, DetectOptions options) const;
-    template <typename RangeGen>
-    void InfillGapRangeGen(const RangeGen &gen_arg, const ResourceAccessStateFunction *infill_op);
+    template <typename RangeGen, typename InfillOp = void>
+    void InfillGapRangeGen(const RangeGen &gen_arg, const InfillOp *infill_op);
     template <typename Detector, typename RangeGen>
     HazardResult DetectHazardGeneratedRanges(Detector &detector, const RangeGen &range_gen, DetectOptions options) const {
         RangeGen mutable_gen(range_gen);
@@ -722,14 +722,18 @@ ResourceAccessRangeMap AccessContext::ResolveAccessRangeGen(const RangeGen &gen_
     return resolve_map;
 }
 
-template <typename RangeGen>
-void AccessContext::InfillGapRangeGen(const RangeGen &gen_arg, const ResourceAccessStateFunction *infill_op) {
+template <typename RangeGen, typename InfillOp>
+void AccessContext::InfillGapRangeGen(const RangeGen &gen_arg, const InfillOp *infill_op) {
     sparse_container::mapped_gap_generator gap_gen(access_state_map_);
     sparse_container::intersection_generator infill_gen(gen_arg, gap_gen);
     using ValueType = ResourceAccessRangeMap::value_type;
     AccessStateConstPtr infill_state;
     if (infill_op) {
+#ifdef WIP_REWORK
         infill_state = std::make_shared<const AccessState>(*default_state_, default_state_.get(), *infill_op);
+#else
+        infill_state = default_state_;
+#endif
     } else {
         infill_state = default_state_;
     }

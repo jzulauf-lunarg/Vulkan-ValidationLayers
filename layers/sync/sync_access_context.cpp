@@ -219,7 +219,7 @@ void AccessContext::ResolvePreviousAccesses() {
     SingleRangeGen single_gen(kFullRange);
     RangeGenWrapper full_range_gen(single_gen);
     ResolveAccessMaps(MakeOpContext(), ResolvePreviousAccessRangeGen(full_range_gen, prev_op, nullptr), access_state_map_);
-    InfillGapRangeGen(single_gen, nullptr);
+    InfillGapRangeGen<SingleRangeGen, void>(single_gen, nullptr);
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer &buffer, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
