@@ -21,6 +21,14 @@
 
 std::atomic<AccessState::OpID> AccessState::OpContext::next_op_(0);
 
+const AccessState::StateConstPtr AccessState::default_resource_state_{std::make_shared<const ResourceAccessState>()};
+const AccessState::PendingConstPtr AccessState::default_pending_state_;
+const AccessState::FirstConstPtr AccessState::default_first_state_{std::make_shared<const FirstAccesses>()};
+const AccessState::FirstConstPtr AccessState::default_first_state_closed_{
+    std::make_shared<const FirstAccesses>(FirstAccesses::ForceClosed())};
+const AccessStateConstPtr AccessState::default_access_state_{std::make_shared<const AccessState>(
+    AccessState::default_resource_state_, AccessState::default_pending_state_, AccessState::default_first_state_)};
+
 size_t AccessStateStats::total_entries = 0;
 size_t AccessStateStats::reused_entries = 0;
 std::array<size_t, static_cast<size_t>(MismatchReason::COUNT)> AccessStateStats::total_compare_stats;
@@ -59,10 +67,10 @@ class HazardDetectFirstUse {
     HazardDetectFirstUse(const AccessStateConstPtr &recorded_use, QueueId queue_id, const ResourceUsageRange &tag_range)
         : recorded_use_(recorded_use), queue_id_(queue_id), tag_range_(tag_range) {}
     HazardResult Detect(const AccessStateConstPtr &state_ptr) const {
-        return state_ptr->GetState().DetectHazard(recorded_use_->GetState(), queue_id_, tag_range_);
+        return state_ptr->GetState().DetectHazard(recorded_use_->GetFirstAccess(), queue_id_, tag_range_);
     }
     HazardResult DetectAsync(const AccessStateConstPtr &state_ptr, ResourceUsageTag start_tag) const {
-        return state_ptr->GetState().DetectAsyncHazard(recorded_use_->GetState(), tag_range_, start_tag);
+        return state_ptr->GetState().DetectAsyncHazard(recorded_use_->GetFirstAccess(), tag_range_, start_tag);
     }
 
   private:
@@ -103,6 +111,60 @@ AccessContext::AccessContext(uint32_t subpass, VkQueueFlags queue_flags,
     }
 }
 
+// Note that second argument is modified in place.
+template <typename Updater>
+void AccessState::SSAUpdate(const OpContext &op, const Updater &updater, AccessStateConstPtr &map_entry) {
+#if 0
+    // WIP WIP WIP
+    if (!map_entry) {
+        assert(map_entry);
+    }
+#endif
+    if (op.Op() == map_entry->result_.op) {
+        // overwrite the map entry with the result
+        map_entry = map_entry->result_.state;
+    } else {
+        AccessStateConstPtr update(updater.Update(op, map_entry));
+        if (update) {
+            // overwrite the map entry with the result
+            map_entry = std::move(update);
+        }
+    }
+
+#if 0
+    // WIP WIP WIP
+    if (!map_entry) {
+        assert(map_entry);
+    }
+#endif
+}
+
+// Resolving the firsts after we resolve the state, allows us to finalize the SSA new state creation
+AccessStateConstPtr AccessState::SSAResolveFirsts(const OpContext &op, const AccessStateConstPtr &access_state_ptr_a,
+                                                  const AccessStateConstPtr &access_state_ptr_b, StatePtr &&update_state) {
+    const FirstAccesses *first_a = access_state_ptr_a->first_.get();
+    const FirstAccesses *first_b = access_state_ptr_b->first_.get();
+    if (first_a) {
+        if (first_a->closed || !first_b) {
+            return std::make_shared<const AccessState>(*access_state_ptr_a, std::move(update_state));
+        }
+        // Note: Neither a nor b are null
+    } else if (first_b) {
+        if (first_b->closed || !first_a) {
+            return std::make_shared<const AccessState>(*access_state_ptr_b, std::move(update_state));
+        }
+        // Note: Neither a nor b are null
+    } else {
+        // Note: both a and b are null
+        return std::make_shared<const AccessState>(std::move(update_state), FirstPtr());
+    }
+
+    // We only fall through if both a and b firsts are non-null
+    FirstPtr update_first = std::make_shared<FirstAccesses>(*first_a);
+    update_first->Merge(*first_b);
+    return std::make_shared<const AccessState>(std::move(update_state), std::move(update_first));
+}
+
 // NOTE: If the maked_shared copies of other become a hotspot, we can implement a policy (template) parameter as to
 //       shallow or deep copies w.r.t. the AccessStates are in the same AccessContext list.
 //       That policy would be specified in the calling context based on whether the AccessStates being merged were
@@ -112,57 +174,62 @@ AccessContext::AccessContext(uint32_t subpass, VkQueueFlags queue_flags,
 // The logic behind resolves is the same as update, we assume that earlier hazards have be reported, and that no
 // tranistive hazard can exists with a hazard between the earlier operations.  Yes, an early hazard can mask that another
 // exists, but if you fix *that* hazard it either fixes or unmasks the subsequent ones.
-AccessStateConstPtr AccessState::SSAResolve(const AccessStateConstPtr &other_access_state, const OpContext &op) const {
+AccessStateConstPtr AccessState::SSAResolve(const OpContext &op, const AccessStateConstPtr &access_state_ptr_a,
+                                            const AccessStateConstPtr &access_state_ptr_b) {
     AccessStateConstPtr resolved;
 
-    // Set if we have resolved this before...
-    if (result_.op == op.Op()) {
-        resolved = result_.LookupResolve(other_access_state);
+    // Set if we have resolved this before... (noting that result is mutable)
+    OpResult &result_a = access_state_ptr_a->result_;
+    OpResult &result_b = access_state_ptr_b->result_;
+    if (result_a.op == op.Op()) {
+        resolved = result_a.LookupResolve(access_state_ptr_b);
         if (resolved) return resolved;
-    } else {
-        result_.InitResolve(op.Op());
+    } else if (result_b.op == op.Op()) {
+        resolved = result_b.LookupResolve(access_state_ptr_a);
+        if (resolved) return resolved;
     }
-
-    const ResourceAccessState &other = other_access_state->GetState();
-    if (state_.HasWriteOp()) {
-        if (other.HasWriteOp()) {
-            const ResourceUsageTag this_write_tag = state_.LastWriteTag();
-            const ResourceUsageTag other_write_tag = other.LastWriteTag();
-            if (this_write_tag < other_write_tag) {
-                // NOTE: Both last and other have writes, and thus first access is "closed". We are selecting other's
-                //       first_access state, but it and this can only differ if there are async hazards
-                //       error state.
-                //
-                // If this is a later write, we've reported any exsiting hazard, and we can just overwrite as the more recent
-                // operation
-                resolved = std::make_shared<const AccessState>(other, op.InsertPoint());
-            } else if (this_write_tag == other_write_tag) {
+    const ResourceAccessState &state_a = *access_state_ptr_a->state_;
+    const ResourceAccessState &state_b = *access_state_ptr_b->state_;
+    if (state_a.HasWriteOp()) {
+        if (state_b.HasWriteOp()) {
+            const ResourceUsageTag write_tag_a = state_a.LastWriteTag();
+            const ResourceUsageTag write_tag_b = state_b.LastWriteTag();
+            // NOTE: Both a and b have writes, and thus first access is "closed". If they differ, we are selecting the latter's
+            //       first_ state, but it and this can only differ if there are async hazards errors,  and we've reported any
+            //       exsiting hazard, and we can just overwrite with the more recent operation
+            if (write_tag_a < write_tag_b) {
+                resolved = access_state_ptr_b;
+            } else if (write_tag_b < write_tag_a) {
+                resolved = access_state_ptr_a;
+            } else {
                 // In the *equals* case for write operations, we merged the write barriers and the read state (but without the
                 // dependency chaining logic or any stage expansion)
-                auto merge_op = [&other](ResourceAccessState &state) { state.ResolveReadWrite(other); };
-                resolved = std::make_shared<const AccessState>(state_, op.InsertPoint(), merge_op);
-            } else {
-                // other write is before this write... in which case we keep this instead of other
-                // and can skip the "first_access" merge, since first_access has been closed since other write tag or before
-                // resolved <- default null value
+                StatePtr update_state = std::make_shared<ResourceAccessState>(state_a);
+                update_state->ResolveReadWrite(state_b);
+                resolved = SSAResolveFirsts(op, access_state_ptr_a, access_state_ptr_b, std::move(update_state));
             }
         } else {
-            // this has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
-            // Since this has a write first access is closed and shouldn't be updated by other
-            // resolved <- default null value
+            // a has a write and other doesn't -- at best async read in other, which have been reported, and will be dropped
+            // Since a has a write first access is closed and shouldn't be updated by other
+            resolved = access_state_ptr_a;
         }
-    } else if (other.HasWriteOp()) {  // && not this->last_write
-        // Other has write and this doesn't, thus keep it, See first access NOTE above
-        resolved = std::make_shared<const AccessState>(other, op.InsertPoint());
+    } else if (state_b.HasWriteOp()) {
+        // b has write a doesn't, thus choose b, See first access NOTE above
+        resolved = access_state_ptr_b;
     } else {  // not this->last_write OR other.last_write
-        // Neither state has a write, just merge the reads
-        auto merge_op = [&other](ResourceAccessState &state) { state.ResolveRead(other); };
-        resolved = std::make_shared<const AccessState>(state_, op.InsertPoint(), merge_op);
+        // Neither state has a write, just merge the reads and the firsts
+        StatePtr update_state = std::make_shared<ResourceAccessState>(state_a);
+        update_state->ResolveRead(state_b);
+        resolved = SSAResolveFirsts(op, access_state_ptr_a, access_state_ptr_b, std::move(update_state));
     }
 
     // Add anything new to the cache
     if (resolved) {
-        result_.CacheResolve(other_access_state, resolved);
+        // We look up both ways, so we can just add one way.
+        if (result_a.op != op.Op()) {
+            result_a.InitResolve(op.Op());
+        }
+        result_a.CacheResolve(access_state_ptr_b, resolved);
     }
 
     return resolved;
@@ -170,23 +237,11 @@ AccessStateConstPtr AccessState::SSAResolve(const AccessStateConstPtr &other_acc
 
 template <typename NormalizeOp>
 void AccessContext::Trim(NormalizeOp &&normalize) {
-    AccessState::TransformUpdater updater(normalize);
-    ForAll(updater);
+    ForAll(normalize);
     sparse_container::consolidate(access_state_map_);
 }
 
-void AccessContext::Trim() {
-    auto normalize = [](ResourceAccessState &resource_state) { resource_state.Normalize(); };
-    Trim(normalize);
-}
-
-void AccessContext::TrimAndClearFirstAccess() {
-    auto normalize = [](ResourceAccessState &resource_state) {
-        resource_state.Normalize();
-        resource_state.ClearFirstUse();
-    };
-    Trim(normalize);
-}
+void AccessContext::TrimAndClearFirstAccess() { Trim(Ops::NormalizeAndClearFirstUse()); }
 
 void AccessContext::AddReferencedTags(ResourceUsageTagSet &used) const {
     auto gather = [&used](const ResourceAccessRangeMap::value_type &access) {
@@ -196,12 +251,16 @@ void AccessContext::AddReferencedTags(ResourceUsageTagSet &used) const {
 }
 
 template <typename Updater>
-void AccessContext::ForAll(Updater &&updater) {
-    AccessState::OpContext op = MakeOpContext();
-
-    for (auto &access : access_state_map_) {
-        access.second = access.second->SSAUpdate(op, updater);
+static void ForAllRangeMap(Updater &&updater, AccessState::OpContext op_context, ResourceAccessRangeMap &map) {
+    for (auto &access : map) {
+        AccessState::SSAUpdate(op_context, updater, access.second);
     }
+}
+
+template <typename Updater>
+void AccessContext::ForAll(Updater &&updater) {
+    AccessState::OpContext op_context = MakeOpContext();
+    ForAllRangeMap(updater, op_context, access_state_map_);
 }
 
 template <typename Action>
@@ -211,8 +270,61 @@ void AccessContext::ConstForAll(Action &&action) const {
     }
 }
 
+template <typename RangeGen>
+void AccessContext::InfillGapRangeGen(const RangeGen &gen_arg, const AccessStateConstPtr &infill_state) {
+    sparse_container::mapped_gap_generator gap_gen(access_state_map_);
+    sparse_container::intersection_generator infill_gen(gen_arg, gap_gen);
+
+    for (; infill_gen->non_empty(); ++infill_gen) {
+        // Inserting before the gap in access_state_map_, the won't confuse the generator when it advances, as
+        // pos is after the current_range in the generator, and insertion doesn't invalidate iterators
+        access_state_map_.insert(infill_gen.get_second_gen().get_pos(), std::make_pair(*infill_gen, infill_state));
+    }
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const ImageRangeGen &range_gen,
+                                       const Ops::ApplyRenderPassLayoutTransition &transition_op) {
+    // Layout transition must infill with default to set the layout transition correctly
+    ResolveFromContextImpl(transition_op, range_gen, from_context, true, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const ImageRangeGen &range_gen,
+                                       const Ops::ApplySemaphoreBarrier &barrier_op) {
+    ResolveFromContextImpl(barrier_op, range_gen, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const Ops::ApplySemaphoreBarrier &barrier_op) {
+    ResolveFromContextImpl(barrier_op, from_context, false, false);
+}
+
 void AccessContext::ResolveFromContext(const AccessContext &from) {
     ResolveAccessMaps(MakeOpContext(), from.access_state_map_, access_state_map_);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const Ops::OffsetTags &offset_tags_op) {
+    ResolveFromContextImpl(offset_tags_op, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const Ops::SetQueueOffsetTags &queue_tag_op) {
+    ResolveFromContextImpl(queue_tag_op, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const ImageRangeGen &range_gen,
+                                       const Ops::ApplyAcquireNextSemaphore &acquire_op) {
+    ResolveFromContextImpl(acquire_op, range_gen, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const Ops::ApplyQueueScopeBarrier &barrier_op) {
+    ResolveFromContextImpl(barrier_op, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const Ops::ApplyBarrierStack &barrier_op) {
+    ResolveFromContextImpl(barrier_op, from_context, false, false);
+}
+
+void AccessContext::ResolveFromContext(const AccessContext &from_context, const ImageRangeGenerator &range_gen,
+                                       const Ops::ApplyQueueScopeBarrier &barrier_op) {
+    ResolveFromContextImpl(barrier_op, range_gen, from_context, false, false);
 }
 
 // Non-lazy import of all accesses, WaitEvents needs this.
@@ -223,15 +335,15 @@ void AccessContext::ResolvePreviousAccesses() {
     SingleRangeGen single_gen(kFullRange);
     RangeGenWrapper full_range_gen(single_gen);
     ResolveAccessMaps(MakeOpContext(), ResolvePreviousAccessRangeGen(full_range_gen, prev_op, nullptr), access_state_map_);
-    InfillGapRangeGen(single_gen, nullptr);
+    InfillGapRangeGen(single_gen, AccessState::DefaultAccessState());
 }
 
 void AccessContext::UpdateAccessState(const vvl::Buffer &buffer, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
                                       const ResourceAccessRange &range, const ResourceUsageTag tag) {
     if (!SimpleBinding(buffer)) return;
     const auto base_address = ResourceBaseAddress(buffer);
-    UpdateMemoryAccessStateFunctor action(current_usage, ordering_rule, tag);
-    UpdateMemoryAccessRangeState(action, range + base_address, UpdateOptions::kUpdateAll);
+    Ops::UpdateAccess action(current_usage, ordering_rule, tag);
+    UpdateMemoryAccessRangeState(action, range + base_address, true);
 }
 
 void AccessContext::UpdateAccessState(const ImageState &image, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
@@ -273,8 +385,8 @@ void AccessContext::UpdateAccessState(const AttachmentViewGen &view_gen, Attachm
 
 void AccessContext::UpdateAccessState(ImageRangeGen &range_gen, SyncStageAccessIndex current_usage, SyncOrdering ordering_rule,
                                       ResourceUsageTag tag) {
-    UpdateMemoryAccessStateFunctor action(current_usage, ordering_rule, tag);
-    UpdateMemoryAccessState(action, range_gen, UpdateOptions::kUpdateAll);
+    Ops::UpdateAccess action(current_usage, ordering_rule, tag);
+    UpdateMemoryAccessState(action, range_gen, true);
 }
 
 void AccessContext::UpdateAccessState(const ImageRangeGen &range_gen, SyncStageAccessIndex current_usage,
@@ -284,11 +396,48 @@ void AccessContext::UpdateAccessState(const ImageRangeGen &range_gen, SyncStageA
     UpdateAccessState(mutable_range_gen, current_usage, ordering_rule, tag);
 }
 
+void AccessContext::UpdateMemoryAccessState(const AttachmentViewGen &view_gen, AttachmentViewGen::Gen gen_type,
+                                            const Ops::ApplyRenderPassLayoutTransition &transition_op) {
+    const std::optional<ImageRangeGen> &attachment_gen = view_gen.GetRangeGen(gen_type);
+    if (attachment_gen) {
+        UpdateMemoryAccessState(transition_op, *attachment_gen, true);
+    }
+}
+
+void AccessContext::UpdateMemoryAccessState(const SingleRangeGen &range_gen, const Ops::UpdatePendingPipelineBarriers &barrier_op) {
+    // Only infill on layout transitions
+    UpdateMemoryAccessState(barrier_op, range_gen, barrier_op.layout_transition);
+}
+
+void AccessContext::UpdateMemoryAccessState(const ImageRangeGen &range_gen, const Ops::UpdatePendingPipelineBarriers &barrier_op) {
+    UpdateMemoryAccessState(barrier_op, range_gen, barrier_op.layout_transition);
+}
+
+void AccessContext::UpdateMemoryAccessState(const SingleRangeGen &range_gen,
+                                            const Ops::UpdateAndApplyGlobalPipelineBarriers &barrier_op) {
+    UpdateMemoryAccessState(barrier_op, range_gen, false);
+}
+
+void AccessContext::UpdateMemoryAccessState(const EventSimpleRangeGenerator &range_gen,
+                                            const Ops::UpdatePendingGlobalEventBarriers &barrier_op) {
+    UpdateMemoryAccessState(barrier_op, range_gen, false);
+}
+void AccessContext::UpdateMemoryAccessState(const EventImageRangeGenerator &range_gen,
+                                            const Ops::UpdatePendingEventBarriers &barrier_op) {
+    UpdateMemoryAccessState(barrier_op, range_gen, barrier_op.layout_transition);
+}
+void AccessContext::UpdateMemoryAccessState(const EventSimpleRangeGenerator &range_gen,
+                                            const Ops::UpdatePendingEventBarriers &barrier_op) {
+    UpdateMemoryAccessState(barrier_op, range_gen, barrier_op.layout_transition);
+}
+
+void AccessContext::UpdateMemoryAccessState(const Ops::ApplyPendingBarriers &apply_pending_op) { ForAll(apply_pending_op); }
+
 void AccessContext::ResolveChildContexts(const std::vector<AccessContext> &contexts) {
     for (uint32_t subpass_index = 0; subpass_index < contexts.size(); subpass_index++) {
         auto &context = contexts[subpass_index];
-        ApplyTrackbackStackAction barrier_action(context.GetDstExternalTrackBack().barriers);
-        ResolveFromContext(barrier_action, context, false, false);
+        Ops::ApplyBarrierStack barrier_action(context.GetDstExternalTrackBack().barriers, false, kInvalidTag);
+        ResolveFromContext(context, barrier_action);
     }
 }
 
@@ -337,7 +486,7 @@ HazardResult AccessContext::DetectHazard(Detector &detector, const AttachmentVie
     const std::optional<ImageRangeGen> &attachment_gen = view_gen.GetRangeGen(gen_type);
     if (!attachment_gen) return HazardResult();
 
-    subresource_adapter::ImageRangeGenerator range_gen(*attachment_gen);
+    ImageRangeGen range_gen(*attachment_gen);
     return DetectHazardGeneratedRanges(detector, range_gen, options);
 }
 
@@ -494,10 +643,6 @@ HazardResult AccessContext::DetectImageBarrierHazard(const SyncImageMemoryBarrie
                                     image_barrier.barrier.src_access_scope, image_barrier.range, kDetectAll);
 }
 
-void AccessContext::UpdateMemoryAccessStateFunctor::operator()(ResourceAccessState &access_state) const {
-    access_state.Update(usage_info, ordering_rule, tag);
-}
-
 // This is called with the *recorded* command buffers access context, with the *active* access context pass in, againsts which
 // hazards will be detected
 HazardResult AccessContext::DetectFirstUseHazard(QueueId queue_id, const ResourceUsageRange &tag_range,
@@ -505,7 +650,7 @@ HazardResult AccessContext::DetectFirstUseHazard(QueueId queue_id, const Resourc
     HazardResult hazard;
     for (const auto &recorded_access : access_state_map_) {
         // Cull any entries not in the current tag range
-        if (!recorded_access.second->GetState().FirstAccessInTagRange(tag_range)) continue;
+        if (!recorded_access.second->GetFirstAccess().AccessInTagRange(tag_range)) continue;
         HazardDetectFirstUse detector(recorded_access.second, queue_id, tag_range);
         hazard = access_context.DetectHazardRange(detector, recorded_access.first, DetectOptions::kDetectAll);
         if (hazard.IsHazard()) break;
@@ -574,33 +719,33 @@ void AccessContext::ResolveAccessMaps(const AccessState::OpContext &op, const Re
         const auto current_range = current->range;
         if (current->pos_B->valid) {
             const auto &src_pos = current->pos_B->lower_bound;
-            const ResourceAccessState &access = src_pos->second->GetState();
             if (current->pos_A->valid) {
                 const auto &dst_pos = current->pos_A->lower_bound;
                 // If dst is the resolved state, resolved gets nullptr, s.t. we can skip the move.
-                AccessStateConstPtr resolved = dst_pos->second->SSAResolve(src_pos->second, op);
+                AccessStateConstPtr resolved = AccessState::SSAResolve(op, dst_pos->second, src_pos->second);
+                const bool new_state = resolved != dst_pos->second;
 
                 if (dst_pos->first == current_range) {
                     // The current destination covers the current range, so we can just update it
-                    // See if we can avoid the resolver
-                    if (resolved) {
+                    // See if we can avoid the update, if the resolved state is the same as the current one
+                    if (new_state) {
                         dst_pos->second = std::move(resolved);
                     }
                 } else {
                     // The current destination only partially matches current range, so split to only modify
                     // the intersection.
+
                     // Note: I believe we still need to split because just because the current dst is correct for the current
                     //       piece of src, doesn't mean the next piece will be, and we've been spliting as we go.
                     const auto trimmed = sparse_container::split(current->pos_A->lower_bound, to, current_range);
-                    if (resolved) {
+                    if (new_state) {
                         trimmed->second = std::move(resolved);
                     }
                     current.invalidate_A(trimmed);
                 }
             } else {
-                // See NOTE near SSAResolve re: deep and shallow copies of "other" regarding the maked_shared versus pointer copy
-                auto inserted = to.insert(current->pos_A->lower_bound,
-                                          std::make_pair(current_range, std::make_shared<AccessState>(access, op.InsertPoint())));
+                // use the from state to infill
+                auto inserted = to.insert(current->pos_A->lower_bound, std::make_pair(current_range, src_pos->second));
                 current.invalidate_A(inserted);  // Update the parallel iterator to point at the insert segment
             }
         }
@@ -661,10 +806,9 @@ HazardResult AccessContext::DetectHazardGeneratedRanges(Detector &detector, Rang
 
     return hazard;
 }
-
 ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeGenWrapper &gen_arg,
                                                                     const AccessState::OpContext &op,
-                                                                    const ResourceAccessStateFunction *previous_barrier) const {
+                                                                    const Ops::ApplyBarrierStack *previous_barrier) const {
     if (prev_.size() == 0) {
         assert(prev_.size() > 0);
     }
@@ -676,7 +820,7 @@ ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeG
     sparse_container::intersection_generator prev_gen(sparse_container::mapped_gap_generator(access_state_map_), gen_arg);
 
     auto recur_prev = [this, &gen_arg, previous_barrier, &op, &prev_gen](const TrackBack &prev_dep) {
-        const ApplyTrackbackStackAction barrier_action(prev_dep.barriers, previous_barrier);
+        const Ops::ApplyBarrierStack barrier_action(prev_dep.barriers, previous_barrier);
         AccessState::OpContext recur_op(op);
         return prev_dep.source_subpass->ResolveAccessRangeGen(prev_gen, barrier_action, recur_op, true);
     };
@@ -724,37 +868,103 @@ ResourceAccessRangeMap AccessContext::ResolvePreviousAccessRangeGen(const RangeG
     return resolved;
 }
 
-template <typename CullingTransform>
-struct CullingUpdater {
-    AccessStateConstPtr operator()(const AccessState::OpContext &op_context, const AccessState &input) const {
-        ResourceAccessState updated(input.GetState());
-        bool cull = transform(updated);
-        AccessStateConstPtr result;
-        if (cull) {
-            result = op_context.DefaultState();
-        } else {
-            result = std::make_shared<const AccessState>(updated, op_context.InsertPoint());
-        }
-        return result;
+template <typename ResolveOp>
+void AccessContext::ResolveFromContextImpl(ResolveOp &&resolve_op, const AccessContext &from_context, bool infill_default,
+                                           bool recur_to_infill) {
+    ResolveFromContextImpl(resolve_op, SingleRangeGen(kFullRange), from_context, infill_default, recur_to_infill);
+}
+
+template <typename ResolveOp, typename RangeGenerator>
+void AccessContext::ResolveFromContextImpl(const ResolveOp &resolve_op, const RangeGenerator &range_gen,
+                                           const AccessContext &from_context, bool infill_default, bool recur_to_infill) {
+    ResourceAccessRangeMap resolve_from =
+        from_context.ResolveAccessRangeGen(range_gen, resolve_op, MakeOpContext(), recur_to_infill);
+    AccessState::OpContext op_context = MakeOpContext();
+    ResolveAccessMaps(op_context, resolve_from, access_state_map_);
+    if (infill_default) {
+        // TODO Memoize infill state
+        AccessStateConstPtr infill_state(resolve_op.Update(op_context, AccessState::DefaultAccessState()));
+        InfillGapRangeGen(range_gen, infill_state);
     }
-    CullingUpdater(const CullingTransform &func) : transform(func) {}
-    const CullingTransform &transform;
+}
+
+template <typename RangeGen, typename BarrierAction>
+ResourceAccessRangeMap AccessContext::ResolveAccessRangeGenNoRecur(const RangeGen &gen_arg, BarrierAction &barrier_action,
+                                                                   const AccessState::OpContext &op) const {
+    ResourceAccessRangeMap resolve_map;
+    sparse_container::intersection_generator range_gen(gen_arg, MapRangeGen(access_state_map_));
+    for (; !range_gen->empty(); ++range_gen) {
+        const auto &pos = range_gen.get_second_gen().get_pos();
+        // Copy and apply barrier
+        AccessStateConstPtr insert_value(pos->second);
+        AccessState::SSAUpdate(op, barrier_action, insert_value);
+        resolve_map.insert(resolve_map.end(), std::make_pair(*range_gen, std::move(insert_value)));
+    }
+    return resolve_map;
+}
+
+template <typename RangeGen, typename BarrierAction>
+ResourceAccessRangeMap AccessContext::ResolveAccessRangeGen(const RangeGen &gen_arg, BarrierAction &barrier_action,
+                                                            const AccessState::OpContext &op, bool recur_to_infill) const {
+    ResourceAccessRangeMap resolve_map(ResolveAccessRangeGenNoRecur(gen_arg, barrier_action, op));
+
+    // Infill if range goes passed both the current and resolve map prior contents
+    if (recur_to_infill && (prev_.size() > 0)) {
+        // This generator is only contains the ranges in gen_arg that are not present in the current map
+        RangeGenWrapper recur_gen(sparse_container::intersection_generator(MapGapGen(resolve_map), gen_arg));
+
+        // ResolvePrevious constructs it's own OpContext's so no need to do so before calling
+        ResourceAccessRangeMap prev_map = ResolvePreviousAccessRangeGen(recur_gen, op);
+        // Apply the non-stacked barrier action
+        ForAllRangeMap(barrier_action, AccessState::OpContext(op), prev_map);
+
+        if (!prev_map.empty()) {
+            // Resolves to last argument, and needs it's own op context
+            ResolveAccessMaps(AccessState::OpContext(op), prev_map, resolve_map);
+        }
+    }
+    return resolve_map;
+}
+
+template <typename RangeGen>
+ResourceAccessRangeMap AccessContext::ResolveAccessRangeGen(const RangeGen &gen_arg, Ops::ApplyBarrierStack &barrier_action,
+                                                            const AccessState::OpContext &op, bool recur_to_infill) const {
+    ResourceAccessRangeMap resolve_map(ResolveAccessRangeGenNoRecur(gen_arg, barrier_action, op));
+
+    // Infill if range goes passed both the current and resolve map prior contents
+    if (recur_to_infill && (prev_.size() > 0)) {
+        // This generator is only contains the ranges in gen_arg that are not present in the current map
+        RangeGenWrapper recur_gen(sparse_container::intersection_generator(MapGapGen(resolve_map), gen_arg));
+
+        // ResolvePrevious constructs it's own OpContext's so no need to do so before calling
+        const ResourceAccessRangeMap prev_map = ResolvePreviousAccessRangeGen(recur_gen, op, &barrier_action);
+
+        if (!prev_map.empty()) {
+            // Resolves to last argument, and needs it's own op context
+            ResolveAccessMaps(AccessState::OpContext(op), prev_map, resolve_map);
+        }
+    }
+    return resolve_map;
+}
+
+template <typename Predicate>
+struct DoApplyPredicatedWait {
+    const Predicate &predicate;
+    bool operator()(ResourceAccessState &state) const { return state.ApplyPredicatedWait<Predicate>(predicate); };
 };
 
 template <typename Predicate>
 void AccessContext::ApplyPredicatedWait(const Predicate &predicate) {
     AccessState::OpContext op_context = MakeOpContext();
-    auto transform = [this, &predicate](ResourceAccessState &state) { return state.ApplyPredicatedWait<Predicate>(predicate); };
+    DoApplyPredicatedWait<Predicate> transform{predicate};
     // The CullingUpdater sets entries returning true from transform to OpContext::DefaultState
-    CullingUpdater updater(transform);
-
-    for (auto &access : access_state_map_) {
-        access.second = access.second->SSAUpdate(op_context, updater);
-    }
+    Ops::ApplyCullingUpdateState<DoApplyPredicatedWait<Predicate>> updater{transform};
+    ForAll(updater);
 
     // Now purge all default value states from the map.
+    const AccessStateConstPtr &default_state = AccessState::DefaultAccessState();
     vvl::EraseIf(access_state_map_,
-                 [this](const ResourceAccessRangeMap::value_type &entry) { return entry.second == default_state_; });
+                 [&default_state](const ResourceAccessRangeMap::value_type &entry) { return entry.second == default_state; });
 }
 
 void AccessContext::ApplyAcquireWait(ResourceUsageTag present_tag, ResourceUsageTag acquire_tag) {
@@ -777,39 +987,179 @@ void AccessContext::ApplyTaggedWait(QueueId queue_id, ResourceUsageTag tag) {
     }
 }
 
-AccessState::~AccessState() {
-    // Remove from linked list1G
-    if (prev_) {
-        prev_->next_ = next_;
-    }
+AccessStateConstPtr AccessState::SSAUpdateAccess(const OpContext &op_context, const AccessStateConstPtr &from,
+                                                 const SyncStageAccessInfoType &usage_info, const SyncOrdering ordering_rule,
+                                                 const ResourceUsageTag tag) {
+    // TODO Memoize state_ update
+    auto update_state = std::make_shared<ResourceAccessState>(*from->state_);
 
-    if (next_) {
-        next_->prev_ = prev_;
+    // WIP TODO Use "write overwrites" logic here
+    // WIP TODO Make ResourceAccessState tags relative to an AccessState tag
+    update_state->Update(usage_info, ordering_rule, tag);
+
+    // Update first iff not closed
+    if (!from->first_->closed) {
+        FirstPtr update_first = std::make_shared<FirstAccesses>(*from->first_);
+        update_first->Update(tag, usage_info, update_state->GetExecutionBarriers(), ordering_rule);
+        return std::make_shared<const AccessState>(std::move(update_state), std::move(update_first));
     }
+    return std::make_shared<const AccessState>(*from, std::move(update_state));
 }
 
-void AccessState::InsertMutable(const AccessState *before) {
-    next_ = before;
-    if (before) {
-        if (before->prev_) {
-            before->prev_->next_ = this;
-        }
-        prev_ = before->prev_;
-        before->prev_ = this;
+template <typename Updater>
+AccessStateConstPtr AccessState::SSAUpdateStateAndFirst(const OpContext &op_context, const AccessStateConstPtr &from,
+                                                        const Updater &updater) {
+    // TODO Memoize update
+    auto update_state = std::make_shared<ResourceAccessState>(*from->state_);
+    updater.Update(*update_state);
+
+    auto update_first = std::make_shared<FirstAccesses>(*from->first_);
+    updater.Update(*update_first);
+
+    return std::make_shared<const AccessState>(std::move(update_state), std::move(update_first));
+}
+
+template <typename Scope, typename BarrierIt>
+AccessStateConstPtr AccessState::SSAApplyScopedBarriers(const Scope &scope, const OpContext &op_context, const AccessState &from,
+                                                        const BarrierIt begin, const BarrierIt end, bool layout_transition,
+                                                        ResourceUsageTag tag) {
+    std::optional<PendingBarriers> immediate_pending;
+    if (from.pending_) {
+        // NOTE: Possible additional memoization here:
+        immediate_pending.emplace(*from.pending_);
     } else {
-        prev_ = nullptr;
+        // Reserve the needed
+        immediate_pending.emplace(*from.state_);
     }
+
+    for (BarrierIt barrier = begin; barrier != end; ++barrier) {
+        from.state_->ApplyBarrier(scope, *barrier, layout_transition, *immediate_pending);
+    }
+
+    return SSAApplyPendingBarriers(op_context, from, tag, *immediate_pending);
 }
 
-const AccessState *AccessState::OpContext::InsertPoint() const {
-    return context_.DefaultAccessState().get();
-    return nullptr;
+template <typename Scope>
+AccessStateConstPtr AccessState::SSAApplyBarrierStack(const Scope &scope, const OpContext &op_context, const AccessState &from,
+                                                      const SyncBarrierStack &barrier_stack) {
+    assert(!from.pending_);
+
+    // TODO Memoize state_ update
+    StatePtr update_state = std::make_shared<ResourceAccessState>(*from.state_);
+    ResourceAccessState &state = *update_state;
+    // If we don't see an layout transition, we won't need a new first.
+    FirstPtr update_first;
+    const bool first_closed = from.first_->closed;
+
+    const SyncBarrierStack *current = &barrier_stack;
+    while (current) {
+        PendingBarriers pending(*from.state_);
+        for (const auto &barrier : current->barriers) {
+            state.ApplyBarrier(scope, barrier, current->layout_transition, pending);
+        }
+
+        state.ApplyPendingBarriers(current->tag, pending);
+
+        // First only cares about the layout transition write op
+        if (current->layout_transition && !first_closed) {
+            const SyncStageAccessInfoType &layout_usage_info = SyncStageAccess::UsageInfo(SYNC_IMAGE_LAYOUT_TRANSITION);
+            if (!update_first) {
+                update_first = std::make_shared<FirstAccesses>(*from.first_);
+            }
+            update_first->Update(current->tag, layout_usage_info, state.GetExecutionBarriers(), SyncOrdering::kNonAttachment);
+            update_first->TouchupForLayoutTransition(current->tag, pending.GetLayoutOrdering());
+        }
+        current = current->prev;
+    }
+
+    if (update_first) {
+        return std::make_shared<const AccessState>(std::move(update_state), std::move(update_first));
+    }
+    return std::make_shared<const AccessState>(from, std::move(update_state));
 }
 
+template <typename Scope, typename BarrierIt>
+AccessStateConstPtr AccessState::SSAUpdateScopedBarriers(const Scope &scope, const OpContext &op_context, const AccessState &from,
+                                                         const BarrierIt begin, const BarrierIt end, bool layout_transition) {
+    // Inefficient to call if begin == end (or barriers are noops), but caller should short circuit
+
+    PendingPtr update_pending;
+    if (from.pending_) {
+        update_pending = std::make_shared<PendingBarriers>(*from.pending_);
+    } else {
+        update_pending = std::make_shared<PendingBarriers>(*from.state_);
+    }
+
+    assert(update_pending);
+    PendingBarriers &pending = *update_pending;
+
+    const ResourceAccessState &state = *from.state_;
+    for (BarrierIt barrier = begin; barrier != end; ++barrier) {
+        state.ApplyBarrier(scope, *barrier, layout_transition, pending);
+    }
+    return std::make_shared<const AccessState>(from, std::move(update_pending));
+}
+
+AccessStateConstPtr AccessState::SSAApplyPendingBarriers(const OpContext &op_context, const AccessState &from,
+                                                         ResourceUsageTag tag) {
+    if (from.pending_) {
+        return SSAApplyPendingBarriers(op_context, from, tag, *from.pending_);
+    }
+    return AccessStateConstPtr();
+}
+
+AccessStateConstPtr AccessState::SSAApplyPendingBarriers(const OpContext &op_context, const AccessState &from, ResourceUsageTag tag,
+                                                         const PendingBarriers &pending) {
+    // TODO Memoize state_ update
+    StatePtr update_state = std::make_shared<ResourceAccessState>(*from.state_);
+    update_state->ApplyPendingBarriers(tag, pending);
+
+    // First only cares about the layout transition write op
+    if (pending.HasLayoutTransition() && !from.first_->closed) {
+        const SyncStageAccessInfoType &layout_usage_info = SyncStageAccess::UsageInfo(SYNC_IMAGE_LAYOUT_TRANSITION);
+        FirstPtr update_first = std::make_shared<FirstAccesses>(*from.first_);
+        update_first->Update(tag, layout_usage_info, update_state->GetExecutionBarriers(), SyncOrdering::kNonAttachment);
+        update_first->TouchupForLayoutTransition(tag, pending.GetLayoutOrdering());
+        return std::make_shared<const AccessState>(std::move(update_state), std::move(update_first));
+    }
+
+    return std::make_shared<const AccessState>(from, std::move(update_state));
+}
+
+AccessStateConstPtr AccessState::SSAApplySemaphoreBarriers(const OpContext &op_context, const AccessState &from,
+                                                           const SemaphoreScope &signal, const SemaphoreScope wait) {
+    // TODO Memoize state_ update
+    StatePtr update_state = std::make_shared<ResourceAccessState>(*from.state_);
+    update_state->ApplySemaphore(signal, wait);
+    return std::make_shared<const AccessState>(from, std::move(update_state));
+}
+
+AccessStateConstPtr AccessState::SSANormalizeAndClearFirstUse(const OpContext &op_context, const AccessState &from) {
+    if (from.GetState().LastReadsSize() > 1 || from.first_) {
+        StatePtr update_state = std::make_shared<ResourceAccessState>(*from.state_);
+        update_state->Normalize();
+        return std::make_shared<const AccessState>(std::move(update_state), FirstAccesses::ForceClosed());
+    }
+    return AccessStateConstPtr();
+}
+template <typename CullingTransform>
+AccessStateConstPtr AccessState::SSACullingUpdateState(const OpContext &op_context, const AccessState &from,
+                                                       const CullingTransform &transform) {
+    StatePtr update_state = std::make_shared<ResourceAccessState>(*from.state_);
+    bool cull = transform(*update_state);
+    if (cull) {
+        return DefaultAccessState();
+    }
+
+    return std::make_shared<const AccessState>(from, std::move(update_state));
+}
+
+#if 0
 const AccessStateConstPtr &AccessState::OpContext::DefaultState() const {
     return context_.DefaultAccessState();
     // TODO: insert return statement here
 }
+#endif
 
 AccessState::OpID AccessState::OpContext::Op() const {
     return op_id_;
@@ -819,3 +1169,211 @@ AccessState::OpID AccessState::OpContext::Op() const {
 AccessState::OpContext::OpContext(const AccessContext &access_context) : context_(access_context), op_id_(++next_op_) {}
 
 AccessState::OpContext::OpContext(const OpContext &other_context) : OpContext(other_context.context_) {}
+
+AccessStateConstPtr AccessContext::Ops::OffsetTags::Update(const AccessState::OpContext &op_context,
+                                                           const AccessStateConstPtr &from) const {
+    return AccessState::SSAUpdateStateAndFirst(op_context, from, *this);
+}
+
+AccessContext::Ops::ApplyAcquireNextSemaphore::ApplyAcquireNextSemaphore(const SyncExecScope &wait_scope,
+                                                                         ResourceUsageTag acquire_tag_)
+    : barrier(getPresentSrcScope(), getPresentValidAccesses(), wait_scope, SyncStageAccessFlags()), acquire_tag(acquire_tag_) {}
+
+AccessStateConstPtr AccessContext::Ops::ApplyAcquireNextSemaphore::Update(const AccessState::OpContext &op_context,
+                                                                          const AccessStateConstPtr &from) const {
+    if (from->GetState().LastWriteTag() <= acquire_tag) {
+        return AccessState::SSAApplyScopedBarriers(ResourceAccessState::UntaggedScopeOps(), op_context, *from, &barrier,
+                                                   &barrier + 1, false, kInvalidTag);
+    }
+    return AccessStateConstPtr();
+}
+
+// kPresentSrcScope/kPresentValidAccesses cannot be regular global variables, because they use global
+// variables from another compilation unit (through syncStageAccessMaskByStageBit() call) for initialization,
+// and initialization of globals between compilation units is undefined. Instead they get initialized
+// on the first use (it's important to ensure this first use is also not initialization of some global!).
+
+const SyncExecScope &AccessContext::Ops::ApplyAcquireNextSemaphore::getPresentSrcScope() const {
+    static const SyncExecScope kPresentSrcScope =
+        SyncExecScope(VK_PIPELINE_STAGE_2_PRESENT_ENGINE_BIT_SYNCVAL,  // mask_param (unused)
+                      VK_PIPELINE_STAGE_2_PRESENT_ENGINE_BIT_SYNCVAL,  // expanded_mask
+                      VK_PIPELINE_STAGE_2_PRESENT_ENGINE_BIT_SYNCVAL,  // exec_scope
+                      getPresentValidAccesses());                      // valid_accesses
+    return kPresentSrcScope;
+}
+
+const SyncStageAccessFlags &AccessContext::Ops::ApplyAcquireNextSemaphore::getPresentValidAccesses() const {
+    static const SyncStageAccessFlags kPresentValidAccesses =
+        SyncStageAccessFlags(SyncStageAccess::AccessScopeByStage(VK_PIPELINE_STAGE_2_PRESENT_ENGINE_BIT_SYNCVAL));
+    return kPresentValidAccesses;
+}
+
+AccessStateConstPtr AccessContext::Ops::UpdateAccess::Update(const AccessState::OpContext &op_context,
+                                                             const AccessStateConstPtr &from) const {
+    assert(usage_info.stage_access_index != SYNC_ACCESS_INDEX_NONE);
+    return AccessState::SSAUpdateAccess(op_context, from, usage_info, ordering_rule, tag);
+}
+
+AccessStateConstPtr AccessContext::Ops::NormalizeAndClearFirstUse::Update(const AccessState::OpContext &op_context,
+                                                                          const AccessStateConstPtr &from) const {
+    return AccessState::SSANormalizeAndClearFirstUse(op_context, *from);
+}
+
+AccessStateConstPtr AccessContext::Ops::ApplySemaphoreBarrier::Update(const AccessState::OpContext &op_context,
+                                                                      const AccessStateConstPtr &from) const {
+    return AccessState::SSAApplySemaphoreBarriers(op_context, *from, signal, wait);
+}
+
+AccessContext::Ops::ApplyRenderPassLayoutTransition::ApplyRenderPassLayoutTransition(const std::vector<SyncBarrier> &barriers_,
+                                                                                     ResourceUsageTag tag_)
+    : barriers(barriers_), scope(), tag(tag_) {}
+
+AccessStateConstPtr AccessContext::Ops::ApplyRenderPassLayoutTransition::Update(const AccessState::OpContext &op_context,
+                                                                                const AccessStateConstPtr &from) const {
+    assert(!barriers.empty());
+    return AccessState::SSAApplyScopedBarriers(scope, op_context, *from, barriers.begin(), barriers.end(), true, tag);
+}
+
+AccessContext::Ops::ApplyBarrierStack::ApplyBarrierStack(const std::vector<SyncBarrier> &barriers, const bool layout_transition,
+                                                         const ResourceUsageTag tag, const SyncBarrierStack *prev)
+    : scope(), barrier_stack{barriers, layout_transition, tag, prev} {}
+AccessContext::Ops::ApplyBarrierStack::ApplyBarrierStack(const std::vector<SyncBarrier> &barriers, const bool layout_transition,
+                                                         const ResourceUsageTag tag, const ApplyBarrierStack &prev)
+    : ApplyBarrierStack(barriers, layout_transition, tag, &prev.barrier_stack) {}
+AccessContext::Ops::ApplyBarrierStack::ApplyBarrierStack(const std::vector<SyncBarrier> &barriers, const ApplyBarrierStack *prev)
+    : ApplyBarrierStack(barriers, false, kInvalidTag, (prev ? &prev->barrier_stack : nullptr)) {}
+// ApplyBarrierStack(barriers, false, kInvalidTag, (prev ? &prev->barrier_stack : static_cast<const SyncBarrierStack *>(nullptr)))
+// {}
+AccessStateConstPtr AccessContext::Ops::ApplyBarrierStack::Update(const AccessState::OpContext &op_context,
+                                                                  const AccessStateConstPtr &from) const {
+    return AccessState::SSAApplyBarrierStack(scope, op_context, *from, barrier_stack);
+}
+
+bool AccessContext::Ops::ApplyQueueScopeBarrier::InitLayoutTransition(QueueId queue_id, bool layout_transition) {
+    return (queue_id != kQueueIdInvalid) ? false : layout_transition;
+}
+
+AccessContext::Ops::ApplyQueueScopeBarrier::ApplyQueueScopeBarrier(QueueId queue_id, const SyncBarrier &barrier_,
+                                                                   bool layout_transition_, ResourceUsageTag tag_)
+    : barrier(barrier_), scope(queue_id), tag(tag_), layout_transition(InitLayoutTransition(queue_id, layout_transition_)) {
+    assert(!layout_transition || (tag != kInvalidTag));
+}
+
+AccessStateConstPtr AccessContext::Ops::ApplyQueueScopeBarrier::Update(const AccessState::OpContext &op_context,
+                                                                       const AccessStateConstPtr &from) const {
+    return AccessState::SSAApplyScopedBarriers(scope, op_context, *from, &barrier, &barrier + 1, layout_transition, tag);
+}
+
+AccessStateConstPtr AccessContext::Ops::ApplyPendingBarriers::Update(const AccessState::OpContext &op_context,
+                                                                     const AccessStateConstPtr &from) const {
+    return AccessState::SSAApplyPendingBarriers(op_context, *from, tag);
+}
+
+AccessStateConstPtr AccessContext::Ops::SetQueueOffsetTags::Update(const AccessState::OpContext &op_context,
+                                                                   const AccessStateConstPtr &from) const {
+    return AccessState::SSAUpdateStateAndFirst(op_context, from, *this);
+}
+
+void AccessContext::Ops::SetQueueOffsetTags::Update(ResourceAccessState &state) const {
+    state.OffsetTag(offset);
+    state.SetQueueId(queue);
+}
+
+void AccessContext::Ops::SetQueueOffsetTags::Update(FirstAccesses &first) const { first.OffsetTag(offset); }
+
+AccessStateConstPtr AccessContext::Ops::UpdatePendingEventBarriers::Update(const AccessState::OpContext &op_context,
+                                                                           const AccessStateConstPtr &from) const {
+    return AccessState::SSAUpdateScopedBarriers(scope, op_context, *from, &barrier, &barrier + 1, layout_transition);
+}
+
+AccessStateConstPtr AccessContext::Ops::UpdatePendingGlobalEventBarriers::Update(const AccessState::OpContext &op_context,
+                                                                                 const AccessStateConstPtr &from) const {
+    if (!barriers.empty()) {
+        return AccessState::SSAUpdateScopedBarriers(scope, op_context, *from, barriers.begin(), barriers.end(), false);
+    }
+    return AccessStateConstPtr();
+}
+
+AccessStateConstPtr AccessContext::Ops::UpdateAndApplyGlobalPipelineBarriers::Update(const AccessState::OpContext &op_context,
+                                                                                     const AccessStateConstPtr &from) const {
+    if (barriers.empty()) {
+        return AccessState::SSAApplyPendingBarriers(op_context, *from, tag);
+    }
+    return AccessState::SSAApplyScopedBarriers(scope, op_context, *from, barriers.begin(), barriers.end(), false, tag);
+}
+
+AccessStateConstPtr AccessContext::Ops::UpdatePendingPipelineBarriers::Update(const AccessState::OpContext &op_context,
+                                                                              const AccessStateConstPtr &from) const {
+    return AccessState::SSAUpdateScopedBarriers(scope, op_context, *from, &barrier, &barrier + 1, layout_transition);
+}
+
+template <typename CullingTransform>
+inline AccessStateConstPtr AccessContext::Ops::ApplyCullingUpdateState<CullingTransform>::Update(
+    const AccessState::OpContext &op_context, const AccessStateConstPtr &from) const {
+    return AccessState::SSACullingUpdateState(op_context, *from, transform);
+}
+
+template <typename UpdateAction>
+class SSAUpdateOperations {
+  public:
+    using Map = ResourceAccessRangeMap;
+    using Range = typename Map::key_type;
+    using Iterator = typename Map::iterator;
+
+    void update(const Iterator &pos) const {
+        auto &access_state = pos->second;
+        // SSAUpdate treats the 2nd arg as read/write, and updates based on the results of the updater
+        AccessState::SSAUpdate(op_context_, updater_, access_state);
+    }
+
+    void infill(Map &accesses, const Iterator &pos, const Range &infill_range) const {
+        if (infill_state_) {
+            accesses.insert(pos, std::make_pair(infill_range, infill_state_));
+        }
+    }
+
+    SSAUpdateOperations(const UpdateAction &update_action, const AccessState::OpContext &op_context, bool infill_default)
+        : updater_(update_action), op_context_(op_context), infill_state_() {
+        if (infill_default) {
+            // SSAUpdate treats the 2nd arg as read/write, and updates based on the results of the updater
+            infill_state_ = AccessState::DefaultAccessState();
+            AccessState::SSAUpdate(op_context, updater_, infill_state_);
+        }
+    }
+
+  private:
+    const UpdateAction &updater_;
+    const AccessState::OpContext &op_context_;
+    AccessStateConstPtr infill_state_;
+};
+
+template <typename Action>
+void AccessContext::UpdateMemoryAccessRangeState(Action &action, const ResourceAccessRange &range, bool infill_default) {
+    UpdateMemoryAccessState(action, sparse_container::single_range_generator(range), infill_default);
+}
+
+// Infill default is needed:
+//    All updates that affect state_ or first_
+//    All all barriers that contain layout transitions (and thus will affect state)
+template <typename Action, typename RangeGen>
+void AccessContext::UpdateMemoryAccessState(const Action &action, const RangeGen &range_gen, bool infill_default) {
+    // Resolve if required
+    if (prev_.size() > 0) {
+        // Only resolves in the intersection of range_gen and the gaps in access_state_map_
+        auto prev_map = ResolvePreviousAccessRangeGen(range_gen, MakeOpContext(), nullptr);
+        if (!prev_map.empty()) {
+            sparse_container::merge_non_intersecting(access_state_map_, prev_map.begin(), prev_map.end(),
+                                                     sparse_container::assign_policy_move());
+        }
+    }
+
+    SSAUpdateOperations update_operations(action, MakeOpContext(), infill_default);
+    RangeGen gen_copy(range_gen);
+    sparse_container::infill_update_rangegen(access_state_map_, gen_copy, update_operations);
+}
+
+template <typename Detector>
+HazardResult AccessContext::DetectHazardRange(Detector &detector, const ResourceAccessRange &range, DetectOptions options) const {
+    sparse_container::single_range_generator range_gen(range);
+    return DetectHazardGeneratedRanges(detector, range_gen, options);
+}

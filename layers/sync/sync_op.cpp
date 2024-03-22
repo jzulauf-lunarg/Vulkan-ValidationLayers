@@ -22,64 +22,6 @@
 
 #include "sync/sync_validation.h"
 
-// Range generators for to allow event scope filtration to be limited to the top of the resource access traversal pipeline
-//
-// Note: there is no "begin/end" or reset facility.  These are each written as "one time through" generators.
-//
-// Usage:
-//  Constructor() -- initializes the generator to point to the begin of the space declared.
-//  *  -- the current range of the generator empty signfies end
-//  ++ -- advance to the next non-empty range (or end)
-
-// Generate the ranges that are the intersection of range and the entries in the RangeMap
-template <typename RangeMap, typename KeyType = typename RangeMap::key_type>
-class MapRangesRangeGenerator {
-  public:
-    using key_type = KeyType;
-    // Default constructed is safe to dereference for "empty" test, but for no other operation.
-    MapRangesRangeGenerator(const RangeMap &map, const KeyType &range) : gen_(MapGen(map), RangeGen(range)) {}
-    MapRangesRangeGenerator(const MapRangesRangeGenerator &from) = default;
-
-    const KeyType &operator*() const { return *gen_; }
-    const KeyType *operator->() const { return &(*gen_); }
-    MapRangesRangeGenerator &operator++() {
-        ++gen_;
-        return *this;
-    }
-    const key_type &seek_forward(const key_type &range) { return gen_.seek_forward(range); }
-
-  protected:
-    using MapGen = sparse_container::mapped_range_generator<RangeMap>;
-    using RangeGen = sparse_container::single_range_generator<KeyType>;
-    using IntersectionGen = sparse_container::intersection_generator<MapGen, RangeGen>;
-    IntersectionGen gen_;
-};
-using EventSimpleRangeGenerator = MapRangesRangeGenerator<ResourceAccessRangeMap>;
-
-// Generate the ranges that are the intersection of the RangeGen ranges and the entries in the FilterMap
-// Templated to allow for different Range generators or map sources...
-template <typename RangeMap, typename RangeGen, typename KeyType = typename RangeMap::key_type>
-class FilteredGeneratorGenerator {
-  public:
-    using key_type = KeyType;
-    FilteredGeneratorGenerator(const RangeMap &map, const RangeGen &gen) : gen_(MapGen(map), gen) {}
-    FilteredGeneratorGenerator(const FilteredGeneratorGenerator &from) = default;
-    const KeyType &operator*() const { return *gen_; }
-    const KeyType *operator->() const { return &(*gen_); }
-    FilteredGeneratorGenerator &operator++() {
-        ++gen_;
-        return *this;
-    }
-    const key_type &seek_forward(const key_type &range) { return gen_.seek_forward(range); }
-
-  protected:
-    using MapGen = sparse_container::mapped_range_generator<RangeMap>;
-    using IntersectionGen = sparse_container::intersection_generator<MapGen, RangeGen>;
-    IntersectionGen gen_;
-};
-
-using EventImageRangeGenerator = FilteredGeneratorGenerator<ResourceAccessRangeMap, subresource_adapter::ImageRangeGenerator>;
-
 SyncOpBarriers::SyncOpBarriers(vvl::Func command, const SyncValidator &sync_state, VkQueueFlags queue_flags,
                                VkPipelineStageFlags srcStageMask, VkPipelineStageFlags dstStageMask,
                                VkDependencyFlags dependencyFlags, uint32_t memoryBarrierCount,
@@ -163,23 +105,30 @@ bool SyncOpPipelineBarrier::Validate(const CommandBufferAccessContext &cb_contex
 }
 
 struct SyncOpPipelineBarrierFunctorFactory {
+#if WIP_DCC
     using BarrierOpFunctor = PipelineBarrierOp;
     using ApplyFunctor = ApplyBarrierFunctor<BarrierOpFunctor>;
     using GlobalBarrierOpFunctor = PipelineBarrierOp;
     using GlobalApplyFunctor = ApplyBarrierOpsFunctor<GlobalBarrierOpFunctor>;
-    using BufferRange = sparse_container::single_range_generator<ResourceAccessRange>;
-    using ImageRange = subresource_adapter::ImageRangeGenerator;
-    using GlobalRange = sparse_container::single_range_generator<ResourceAccessRange>;
+#endif
+    using PendingBarrierOp = AccessContext::Ops::UpdatePendingPipelineBarriers;
+    using GlobalPendingBarrierOp = AccessContext::Ops::UpdateAndApplyGlobalPipelineBarriers;
+    using BufferRange = SingleRangeGen;
+    using ImageRange = ImageRangeGen;
+    using GlobalRange = SingleRangeGen;
     using ImageState = syncval_state::ImageState;
 
-    ApplyFunctor MakeApplyFunctor(QueueId queue_id, const SyncBarrier &barrier, bool layout_transition) const {
-        return ApplyFunctor(BarrierOpFunctor(queue_id, barrier, layout_transition));
+    PendingBarrierOp MakePendingBarrierOp(QueueId queue_id, const SyncBarrier &barrier, bool layout_transition) const {
+        if (queue_id != kQueueIdInvalid) {
+            // This is a submit time application... supress layout transitions to not taint the QueueBatchContext write state
+            layout_transition = false;
+        }
+        return PendingBarrierOp{ResourceAccessState::QueueScopeOps(queue_id), barrier, layout_transition};
     }
-    GlobalApplyFunctor MakeGlobalApplyFunctor(size_t size_hint, ResourceUsageTag tag) const {
-        return GlobalApplyFunctor(true /* resolve */, size_hint, tag);
-    }
-    GlobalBarrierOpFunctor MakeGlobalBarrierOpFunctor(QueueId queue_id, const SyncBarrier &barrier) const {
-        return GlobalBarrierOpFunctor(queue_id, barrier, false);
+
+    GlobalPendingBarrierOp MakeGlobalBarrierOp(QueueId queue_id, const std::vector<SyncBarrier> &barriers,
+                                               ResourceUsageTag tag) const {
+        return GlobalPendingBarrierOp{ResourceAccessState::QueueScopeOps(queue_id), tag, barriers};
     }
 
     BufferRange MakeRangeGen(const vvl::Buffer &buffer, const ResourceAccessRange &range) const {
@@ -199,9 +148,9 @@ void SyncOpBarriers::ApplyBarriers(const Barriers &barriers, const FunctorFactor
     for (const auto &barrier : barriers) {
         const auto *state = barrier.GetState();
         if (state) {
-            auto update_action = factory.MakeApplyFunctor(queue_id, barrier.barrier, barrier.IsLayoutTransition());
+            auto update_op = factory.MakePendingBarrierOp(queue_id, barrier.barrier, barrier.IsLayoutTransition());
             auto range_gen = factory.MakeRangeGen(*state, barrier.Range());
-            access_context->UpdateMemoryAccessState(update_action, range_gen, update_action.UpdateOptions());
+            access_context->UpdateMemoryAccessState(range_gen, update_op);
         }
     }
 }
@@ -209,12 +158,9 @@ void SyncOpBarriers::ApplyBarriers(const Barriers &barriers, const FunctorFactor
 template <typename Barriers, typename FunctorFactory>
 void SyncOpBarriers::ApplyGlobalBarriers(const Barriers &barriers, const FunctorFactory &factory, const QueueId queue_id,
                                          const ResourceUsageTag tag, AccessContext *access_context) {
-    auto barriers_functor = factory.MakeGlobalApplyFunctor(barriers.size(), tag);
-    for (const auto &barrier : barriers) {
-        barriers_functor.EmplaceBack(factory.MakeGlobalBarrierOpFunctor(queue_id, barrier));
-    }
+    auto barriers_op = factory.MakeGlobalBarrierOp(queue_id, barriers, tag);
     auto range_gen = factory.MakeGlobalRangeGen();
-    access_context->UpdateMemoryAccessState(barriers_functor, range_gen, barriers_functor.UpdateOptions());
+    access_context->UpdateMemoryAccessState(range_gen, barriers_op);
 }
 
 ResourceUsageTag SyncOpPipelineBarrier::Record(CommandBufferAccessContext *cb_context) {
@@ -557,10 +503,15 @@ bool SyncOpWaitEvents::DoValidate(const CommandExecutionContext &exec_context, c
 }
 
 struct SyncOpWaitEventsFunctorFactory {
+#ifdef WIP_DCC
     using BarrierOpFunctor = WaitEventBarrierOp;
     using ApplyFunctor = ApplyBarrierFunctor<BarrierOpFunctor>;
     using GlobalBarrierOpFunctor = WaitEventBarrierOp;
     using GlobalApplyFunctor = ApplyBarrierOpsFunctor<GlobalBarrierOpFunctor>;
+#endif
+
+    using PendingBarrierOp = AccessContext::Ops::UpdatePendingEventBarriers;
+    using GlobalPendingBarrierOp = AccessContext::Ops::UpdatePendingGlobalEventBarriers;
     using BufferRange = EventSimpleRangeGenerator;
     using ImageRange = EventImageRangeGenerator;
     using GlobalRange = EventSimpleRangeGenerator;
@@ -573,16 +524,18 @@ struct SyncOpWaitEventsFunctorFactory {
         barrier.src_access_scope = sync_event->scope.valid_accesses & barrier.src_access_scope;
         return barrier;
     }
-    ApplyFunctor MakeApplyFunctor(QueueId queue_id, const SyncBarrier &barrier_arg, bool layout_transition) const {
+    PendingBarrierOp MakePendingBarrierOp(QueueId queue_id, const SyncBarrier &barrier_arg, bool layout_transition) const {
         auto barrier = RestrictToEvent(barrier_arg);
-        return ApplyFunctor(BarrierOpFunctor(queue_id, sync_event->first_scope_tag, barrier, layout_transition));
+        if (queue_id != kQueueIdInvalid) {
+            // This is a submit time application... supress layout transitions to not taint the QueueBatchContext write state
+            layout_transition = false;
+        }
+        return PendingBarrierOp{ResourceAccessState::EventScopeOps(queue_id, sync_event->first_scope_tag), barrier,
+                                layout_transition};
     }
-    GlobalApplyFunctor MakeGlobalApplyFunctor(size_t size_hint, ResourceUsageTag tag) const {
-        return GlobalApplyFunctor(false /* don't resolve */, size_hint, tag);
-    }
-    GlobalBarrierOpFunctor MakeGlobalBarrierOpFunctor(const QueueId queue_id, const SyncBarrier &barrier_arg) const {
-        auto barrier = RestrictToEvent(barrier_arg);
-        return GlobalBarrierOpFunctor(queue_id, sync_event->first_scope_tag, barrier, false);
+    GlobalPendingBarrierOp MakeGlobalBarrierOp(QueueId queue_id, const std::vector<SyncBarrier> &barriers, ResourceUsageTag) const {
+        // For events, GlobalBarrierOp doesn't resolve
+        return GlobalPendingBarrierOp{ResourceAccessState::EventScopeOps(queue_id, sync_event->first_scope_tag), barriers};
     }
 
     BufferRange MakeRangeGen(const vvl::Buffer &buffer, const ResourceAccessRange &range_arg) const {
@@ -655,8 +608,7 @@ void SyncOpWaitEvents::ReplayRecord(CommandExecutionContext &exec_context, Resou
     }
 
     // Apply the pending barriers
-    ResolvePendingBarrierFunctor apply_pending_action(exec_tag);
-    access_context->ApplyToContext(apply_pending_action, apply_pending_action.UpdateOptions());
+    access_context->UpdateMemoryAccessState(AccessContext::Ops::ApplyPendingBarriers{exec_tag});
 }
 
 bool SyncOpWaitEvents::ReplayValidate(ReplayState &replay, ResourceUsageTag recorded_tag) const {
@@ -874,7 +826,7 @@ void SyncOpSetEvent::ReplayRecord(CommandExecutionContext &exec_context, Resourc
 
     // Note: merged_context is a copy of the access_context, combined with the recorded context
     auto merged_context = std::make_shared<AccessContext>(*access_context);
-    merged_context->ResolveFromContext(QueueTagOffsetBarrierAction(queue_id, exec_tag), *recorded_context_);
+    merged_context->ResolveFromContext(*recorded_context_, AccessContext::Ops::SetQueueOffsetTags{queue_id, exec_tag});
     merged_context->TrimAndClearFirstAccess();  // Ensure the copy is minimal and normalized
     DoRecord(queue_id, exec_tag, merged_context, events_context);
 }

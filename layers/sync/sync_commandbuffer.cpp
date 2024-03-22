@@ -827,8 +827,11 @@ void CommandBufferAccessContext::RecordExecutedCommandBuffer(const CommandBuffer
 }
 
 void CommandBufferAccessContext::ResolveExecutedCommandBuffer(const AccessContext &recorded_context, ResourceUsageTag offset) {
+#ifdef WIP_DCC
     auto tag_offset = [offset](ResourceAccessState &access) { access.OffsetTag(offset); };
-    GetCurrentAccessContext()->ResolveFromContext(tag_offset, recorded_context);
+#endif
+    const AccessContext::Ops::OffsetTags offset_tags{offset};
+    GetCurrentAccessContext()->ResolveFromContext(recorded_context, offset_tags);
 }
 
 void CommandBufferAccessContext::InsertRecordedAccessLogEntries(const CommandBufferAccessContext &recorded_context) {

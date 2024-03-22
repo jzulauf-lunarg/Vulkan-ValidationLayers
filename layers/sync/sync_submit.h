@@ -25,7 +25,7 @@ class QueueSyncState;
 
 struct AcquiredImage {
     std::shared_ptr<const syncval_state::ImageState> image;
-    subresource_adapter::ImageRangeGenerator generator;
+    ImageRangeGen generator;
     ResourceUsageTag present_tag;
     ResourceUsageTag acquire_tag;
     bool Invalid() const { return BASE_NODE::Invalid(image); }
@@ -114,7 +114,7 @@ struct PresentedImageRecord {
 
 struct PresentedImage : public PresentedImageRecord {
     std::shared_ptr<QueueBatchContext> batch;
-    subresource_adapter::ImageRangeGenerator range_gen;
+    ImageRangeGen range_gen;
 
     PresentedImage() = default;
     void UpdateMemoryAccess(SyncStageAccessIndex usage, ResourceUsageTag tag, AccessContext &access_context) const;

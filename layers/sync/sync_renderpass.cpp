@@ -461,19 +461,11 @@ void RenderPassAccessContext::RecordLayoutTransitions(const vvl::RenderPass &rp_
         // Import the attachments into the current context
         const auto *prev_context = trackback->source_subpass;
         assert(prev_context);
-        ApplySubpassTransitionBarriersAction barrier_action(trackback->barriers);
+
         const std::optional<ImageRangeGen> &attachment_gen = view_gen.GetRangeGen(AttachmentViewGen::Gen::kViewSubresource);
         assert(attachment_gen);
-
-        access_context.ResolveFromContext(barrier_action, *attachment_gen, *prev_context, &empty_infill,
-                                          true /* recur to infill */);
-        assert(attachment_gen);
-    }
-
-    // If there were no transitions skip this global map walk
-    if (transitions.size()) {
-        ResolvePendingBarrierFunctor apply_pending_action(tag);
-        access_context.ApplyToContext(apply_pending_action, apply_pending_action.UpdateOptions());
+        access_context.ResolveFromContext(*prev_context, *attachment_gen,
+                                          AccessContext::Ops::ApplyRenderPassLayoutTransition(trackback->barriers, tag));
     }
 }
 
@@ -938,11 +930,15 @@ void RenderPassAccessContext::RecordEndRenderPass(AccessContext *external_contex
         const AttachmentViewGen &view_gen = attachment_views_[transition.attachment];
         const auto &last_trackback = subpass_contexts_[transition.prev_pass].GetDstExternalTrackBack();
         assert(&subpass_contexts_[transition.prev_pass] == last_trackback.source_subpass);
+#ifdef WIP_DCC
         ApplyBarrierOpsFunctor<PipelineBarrierOp> barrier_action(true /* resolve */, last_trackback.barriers.size(), barrier_tag);
         for (const auto &barrier : last_trackback.barriers) {
             barrier_action.EmplaceBack(PipelineBarrierOp(kQueueIdInvalid, barrier, true));
         }
-        external_context->ApplyUpdateAction(view_gen, AttachmentViewGen::Gen::kViewSubresource, barrier_action);
+#endif
+        external_context->UpdateMemoryAccessState(
+            view_gen, AttachmentViewGen::Gen::kViewSubresource,
+            AccessContext::Ops::ApplyRenderPassLayoutTransition(last_trackback.barriers, barrier_tag));
     }
 }
 

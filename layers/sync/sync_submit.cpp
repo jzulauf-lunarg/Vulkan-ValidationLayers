@@ -183,8 +183,10 @@ PresentedImage syncval_state::Swapchain::MovePresentedImage(uint32_t image_index
     return ret_val;
 }
 
+#if WIP_DCC
 class ApplySemaphoreBarrierAction {
   public:
+    using UpdateOpType = AccessStateOps::UpdateState;
     ApplySemaphoreBarrierAction(const SemaphoreScope& signal, const SemaphoreScope& wait) : signal_(signal), wait_(wait) {}
     void operator()(ResourceAccessState& access) const { access.ApplySemaphore(signal_, wait_); }
 
@@ -229,6 +231,7 @@ class ApplyAcquireNextSemaphoreAction {
     std::vector<SyncBarrier> barrier_;
     ResourceUsageTag acq_tag_;
 };
+#endif
 
 QueueBatchContext::QueueBatchContext(const SyncValidator& sync_state, const QueueSyncState& queue_state, uint64_t submit_index,
                                      uint32_t batch_index)
@@ -264,7 +267,7 @@ void QueueBatchContext::Trim() {
 }
 
 void QueueBatchContext::ResolveSubmittedCommandBuffer(const AccessContext& recorded_context, ResourceUsageTag offset) {
-    GetCurrentAccessContext()->ResolveFromContext(QueueTagOffsetBarrierAction(GetQueueId(), offset), recorded_context);
+    GetCurrentAccessContext()->ResolveFromContext(recorded_context, AccessContext::Ops::SetQueueOffsetTags{GetQueueId(), offset});
 }
 
 VulkanTypedHandle QueueBatchContext::Handle() const { return queue_state_->Handle(); }
@@ -323,29 +326,38 @@ std::shared_ptr<QueueBatchContext> QueueBatchContext::ResolveOneWaitSemaphore(Vk
 
     // If signal queue == wait queue, signal is treated as a memory barrier with an access scope equal to the present accesses
     SyncBarrier sem_barrier(signal_scope, wait_scope, SyncBarrier::AllAccess());
-    const BatchBarrierOp sem_same_queue_op(wait_scope.queue, sem_barrier);
 
     // Need to import the rest of the same queue contents without modification
     SyncBarrier noop_barrier;
+#ifdef WIP_DCC
+    const BatchBarrierOp sem_same_queue_op(wait_scope.queue, sem_barrier);
     const BatchBarrierOp noop_barrier_op(wait_scope.queue, noop_barrier);
+#endif
 
     // Otherwise apply semaphore rules apply
+#ifdef WIP_DCC
     const ApplySemaphoreBarrierAction sem_not_same_queue_op(signal_scope, wait_scope);
+#endif
     const SemaphoreScope noop_semaphore_scope(queue_id, noop_barrier.dst_exec_scope);
+#ifdef WIP_DCC
     const ApplySemaphoreBarrierAction noop_sem_op(signal_scope, noop_semaphore_scope);
+#endif
 
     // For each presented image
     for (const auto& presented : presented_images) {
         // Need a copy that can be used as the pseudo-iterator...
-        subresource_adapter::ImageRangeGenerator range_gen(presented.range_gen);
+        ImageRangeGen range_gen(presented.range_gen);
         if (signal_scope.queue == wait_scope.queue) {
             // If signal queue == wait queue, signal is treated as a memory barrier with an access scope equal to the
             // valid accesses for the sync scope.
-            access_context_.ResolveFromContext(sem_same_queue_op, range_gen, from_context);
-            access_context_.ResolveFromContext(noop_barrier_op, from_context);
+            access_context_.ResolveFromContext(from_context, range_gen,
+                                               AccessContext::Ops::ApplyQueueScopeBarrier(wait_scope.queue, sem_barrier, false));
+            access_context_.ResolveFromContext(from_context);
         } else {
-            access_context_.ResolveFromContext(sem_not_same_queue_op, range_gen, from_context);
-            access_context_.ResolveFromContext(noop_sem_op, from_context);
+            access_context_.ResolveFromContext(from_context, range_gen,
+                                               AccessContext::Ops::ApplySemaphoreBarrier{signal_scope, wait_scope});
+            access_context_.ResolveFromContext(from_context,
+                                               AccessContext::Ops::ApplySemaphoreBarrier{signal_scope, noop_semaphore_scope});
         }
     }
 
@@ -370,24 +382,27 @@ std::shared_ptr<QueueBatchContext> QueueBatchContext::ResolveOneWaitSemaphore(Vk
     const AccessContext& from_context = signal_state->batch->access_context_;
     if (signal_state->acquired.image) {
         // Import the *presenting* batch, but replacing presenting with acquired.
-        ApplyAcquireNextSemaphoreAction apply_acq(wait_scope, signal_state->acquired.acquire_tag);
-        access_context_.ResolveFromContext(apply_acq, signal_state->acquired.generator, from_context);
+        access_context_.ResolveFromContext(
+            from_context, signal_state->acquired.generator,
+            AccessContext::Ops::ApplyAcquireNextSemaphore{wait_scope, signal_state->acquired.acquire_tag});
 
+#ifdef WIP_DCC
         // Grab the reset of the presenting QBC, with no effective barrier, won't overwrite the acquire, as the tag is newer
         SyncBarrier noop_barrier;
         const BatchBarrierOp noop_barrier_op(wait_scope.queue, noop_barrier);
-        access_context_.ResolveFromContext(noop_barrier_op, from_context);
+#endif
+        access_context_.ResolveFromContext(from_context);
     } else {
         if (signal_scope.queue == wait_scope.queue) {
             // If signal queue == wait queue, signal is treated as a memory barrier with an access scope equal to the
             // valid accesses for the sync scope.
             SyncBarrier sem_barrier(signal_scope, wait_scope, SyncBarrier::AllAccess());
-            const BatchBarrierOp sem_barrier_op(wait_scope.queue, sem_barrier);
-            access_context_.ResolveFromContext(sem_barrier_op, from_context);
+            access_context_.ResolveFromContext(from_context,
+                                               AccessContext::Ops::ApplyQueueScopeBarrier(wait_scope.queue, sem_barrier));
             events_context_.ApplyBarrier(sem_barrier.src_exec_scope, sem_barrier.dst_exec_scope, ResourceUsageRecord::kMaxIndex);
         } else {
-            ApplySemaphoreBarrierAction sem_op(signal_scope, wait_scope);
-            access_context_.ResolveFromContext(sem_op, signal_state->batch->access_context_);
+            access_context_.ResolveFromContext(signal_state->batch->access_context_,
+                                               AccessContext::Ops::ApplySemaphoreBarrier{signal_scope, wait_scope});
         }
     }
     // Cannot move from the signal state because it could be from the const global state, and C++ doesn't

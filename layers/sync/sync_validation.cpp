@@ -2863,8 +2863,7 @@ ImageRangeGen syncval_state::ImageState::MakeImageRangeGen(const VkImageSubresou
     }
 
     const auto base_address = GetResourceBaseAddress();
-    subresource_adapter::ImageRangeGenerator range_gen(*fragment_encoder.get(), subresource_range, offset, extent, base_address,
-                                                       is_depth_sliced);
+    ImageRangeGen range_gen(*fragment_encoder.get(), subresource_range, offset, extent, base_address, is_depth_sliced);
     return range_gen;
 }
 

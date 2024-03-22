@@ -30,8 +30,6 @@ struct BufferBinding;
 class HazardResult;
 class SyncValidator;
 
-using ImageRangeGen = subresource_adapter::ImageRangeGenerator;
-
 // The resource tag index is relative to the command buffer or queue in which it's found
 using QueueId = uint32_t;
 constexpr static QueueId kQueueIdBase = QueueId(0);
@@ -58,6 +56,9 @@ ResourceAccessRange MakeRange(const BufferBinding &binding, uint32_t first_index
                               uint32_t stride);
 
 extern const ResourceAccessRange kFullRange;
+
+using ImageRangeGen = subresource_adapter::ImageRangeGenerator;
+using SingleRangeGen = sparse_container::single_range_generator<ResourceAccessRange>;
 
 constexpr VkImageAspectFlags kColorAspects =
     VK_IMAGE_ASPECT_COLOR_BIT | VK_IMAGE_ASPECT_PLANE_0_BIT | VK_IMAGE_ASPECT_PLANE_1_BIT | VK_IMAGE_ASPECT_PLANE_2_BIT;
